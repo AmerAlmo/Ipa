@@ -8,27 +8,32 @@ jobs:
       - name: Create App Files
         run: |
           cat << 'EOF' > project.yml
-          name: GameTranslator
+          name: GameTranslatorHD
           options:
-            bundleIdPrefix: com.ipad.translator
+            bundleIdPrefix: com.ipad.nativehd
             deploymentTarget:
               iOS: "15.0"
           targets:
-            GameTranslator:
+            GameTranslatorHD:
               type: application
               platform: iOS
+              supportedDestinations: [iOS]
               sources:
                 - App.swift
               settings:
                 base:
                   TARGETED_DEVICE_FAMILY: "1,2"
+                  SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
+                  INFOPLIST_KEY_UIRequiresFullScreen: NO
               info:
                 path: Info.plist
                 properties:
-                  UILaunchScreen: {}
-                  UIRequiresFullScreen: true
+                  UILaunchScreen:
+                    UIColorName: ""
+                  UIRequiresFullScreen: false
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationPortraitUpsideDown
                     - UIInterfaceOrientationLandscapeLeft
                     - UIInterfaceOrientationLandscapeRight
                   UISupportedInterfaceOrientations~ipad:
@@ -50,7 +55,7 @@ jobs:
               var body: some Scene {
                   WindowGroup {
                       ContentView()
-                          .statusBar(hidden: false)
+                          .ignoresSafeArea(.all, edges: .bottom)
                   }
               }
           }
@@ -60,7 +65,7 @@ jobs:
               @Published var isAutoTranslating: Bool = false
               @Published var isEditingRegion: Bool = false
               @Published var translatedText: String = ""
-              @Published var region: CGRect = CGRect(x: 0.12, y: 0.65, width: 0.76, height: 0.22)
+              @Published var region: CGRect = CGRect(x: 0.15, y: 0.68, width: 0.70, height: 0.20)
 
               private var lastNormalizedText: String = ""
               private var isBusy: Bool = false
@@ -108,6 +113,7 @@ jobs:
                   isBusy = true
 
                   let config = WKSnapshotConfiguration()
+                  // Capture at native Retina scale
                   webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
                           self?.isBusy = false
@@ -221,13 +227,18 @@ jobs:
                   config.mediaTypesRequiringUserActionForPlayback = []
 
                   let wv = WKWebView(frame: .zero, configuration: config)
+                  // Force Desktop Safari on iPadOS User-Agent for crisp Canvas rendering
+                  wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
                   wv.allowsBackForwardNavigationGestures = true
                   wv.scrollView.contentInsetAdjustmentBehavior = .never
+                  wv.contentScaleFactor = UIScreen.main.scale
                   vm.webView = wv
                   if let url = URL(string: vm.urlString) { wv.load(URLRequest(url: url)) }
                   return wv
               }
-              func updateUIView(_ uiView: WKWebView, context: Context) {}
+              func updateUIView(_ uiView: WKWebView, context: Context) {
+                  uiView.contentScaleFactor = UIScreen.main.scale
+              }
           }
 
           struct ContentView: View {
@@ -240,7 +251,7 @@ jobs:
                   ZStack {
                       VStack(spacing: 0) {
                           if showBar {
-                              HStack(spacing: 10) {
+                              HStack(spacing: 12) {
                                   Button(action: { vm.webView?.goBack() }) {
                                       Image(systemName: "chevron.backward").font(.system(size: 18, weight: .semibold)).padding(8)
                                   }
@@ -254,10 +265,10 @@ jobs:
                                       .disableAutocorrection(true)
                                   Button("ذهاب") { vm.loadURL() }
                                       .font(.system(size: 16, weight: .bold))
-                                      .padding(.horizontal, 14).padding(.vertical, 8)
+                                      .padding(.horizontal, 16).padding(.vertical, 8)
                                       .background(Color.blue).foregroundColor(.white).cornerRadius(8)
                               }
-                              .padding(.horizontal, 14)
+                              .padding(.horizontal, 16)
                               .padding(.vertical, 8)
                               .background(Color(UIColor.secondarySystemBackground))
                           }
@@ -270,8 +281,8 @@ jobs:
 
                               ZStack {
                                   WebViewWrapper(vm: vm)
+                                      .frame(width: geo.size.width, height: geo.size.height)
 
-                                  // Crisp Movie Subtitle Overlay
                                   if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion {
                                       Text(vm.translatedText)
                                           .font(.system(size: 22, weight: .bold))
@@ -287,7 +298,6 @@ jobs:
                                           .allowsHitTesting(false)
                                   }
 
-                                  // Region Selector Editor
                                   if vm.isEditingRegion {
                                       ZStack(alignment: .bottomTrailing) {
                                           Rectangle()
@@ -342,7 +352,6 @@ jobs:
                           }
                       }
 
-                      // Floating Bottom Controls (Properly padded for iPad screen)
                       VStack {
                           Spacer()
                           HStack(spacing: 12) {
@@ -386,8 +395,8 @@ jobs:
                                   .shadow(radius: 3)
                               }
                           }
-                          .padding(.horizontal, 24)
-                          .padding(.bottom, 16)
+                          .padding(.horizontal, 28)
+                          .padding(.bottom, 20)
                       }
                   }
               }
@@ -398,13 +407,21 @@ jobs:
         run: |
           brew install xcodegen
           xcodegen generate
-          xcodebuild -project GameTranslator.xcodeproj -scheme GameTranslator -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          xcodebuild -project GameTranslatorHD.xcodeproj \
+            -scheme GameTranslatorHD \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            TARGETED_DEVICE_FAMILY="1,2" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
           mkdir Payload
-          cp -r build/Build/Products/Release-iphoneos/GameTranslator.app Payload/
-          zip -r GameTranslator.ipa Payload
+          cp -r build/Build/Products/Release-iphoneos/GameTranslatorHD.app Payload/
+          zip -r GameTranslatorHD.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Ready-GameTranslator-IPA
-          path: GameTranslator.ipa
+          name: Ready-GameTranslatorHD-IPA
+          path: GameTranslatorHD.ipa
