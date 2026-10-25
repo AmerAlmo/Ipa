@@ -1,0 +1,234 @@
+name: Make IPA
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Create App Files
+        run: |
+          cat << 'EOF' > project.yml
+          name: GameTranslator
+          options:
+            bundleIdPrefix: com.ipad.translator
+            deploymentTarget:
+              iOS: "15.0"
+          targets:
+            GameTranslator:
+              type: application
+              platform: iOS
+              sources:
+                - App.swift
+              info:
+                path: Info.plist
+                properties:
+                  UILaunchScreen: {}
+                  UIRequiresFullScreen: false
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  UISupportedInterfaceOrientations~ipad:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationPortraitUpsideDown
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  NSAppTransportSecurity:
+                    NSAllowsArbitraryLoads: true
+          EOF
+
+          cat << 'EOF' > App.swift
+          import SwiftUI
+          import WebKit
+          import Vision
+
+          @main
+          struct GameTranslatorApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+
+          struct TranslatedBox: Identifiable {
+              let id = UUID()
+              let originalText: String
+              var translatedText: String
+              let rect: CGRect
+          }
+
+          class BrowserViewModel: ObservableObject {
+              @Published var urlString: String = "https://www.google.com"
+              @Published var isTranslating: Bool = false
+              @Published var showOverlay: Bool = false
+              @Published var boxes: [TranslatedBox] = []
+              weak var webView: WKWebView?
+
+              func loadURL() {
+                  var formatted = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if !formatted.hasPrefix("http://") && !formatted.hasPrefix("https://") {
+                      formatted = "https://" + formatted
+                  }
+                  if let url = URL(string: formatted) {
+                      webView?.load(URLRequest(url: url))
+                  }
+              }
+
+              func captureAndTranslate() {
+                  guard let webView = webView else { return }
+                  isTranslating = true
+                  boxes.removeAll()
+                  webView.takeSnapshot(with: nil) { [weak self] image, _ in
+                      guard let self = self, let cgImage = image?.cgImage else {
+                          self?.isTranslating = false
+                          return
+                      }
+                      self.recognizeText(in: cgImage)
+                  }
+              }
+
+              private func recognizeText(in cgImage: CGImage) {
+                  let request = VNRecognizeTextRequest { [weak self] req, _ in
+                      guard let self = self, let results = req.results as? [VNRecognizedTextObservation] else {
+                          DispatchQueue.main.async { self?.isTranslating = false }
+                          return
+                      }
+                      var temp: [TranslatedBox] = []
+                      for obs in results {
+                          guard let top = obs.topCandidates(1).first else { continue }
+                          let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                          if txt.count < 2 { continue }
+                          let b = obs.boundingBox
+                          let rect = CGRect(x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, width: b.size.width, height: b.size.height)
+                          temp.append(TranslatedBox(originalText: txt, translatedText: "...", rect: rect))
+                      }
+                      DispatchQueue.main.async {
+                          self.boxes = temp
+                          self.showOverlay = true
+                          self.translateAll()
+                      }
+                  }
+                  request.recognitionLevel = .accurate
+                  request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR"]
+                  DispatchQueue.global(qos: .userInitiated).async {
+                      try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+                  }
+              }
+
+              private func translateAll() {
+                  guard !boxes.isEmpty else { isTranslating = false; return }
+                  let group = DispatchGroup()
+                  for i in boxes.indices {
+                      group.enter()
+                      let orig = boxes[i].originalText
+                      guard let enc = orig.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                            let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=\(enc)") else {
+                          group.leave()
+                          continue
+                      }
+                      URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                          var res = orig
+                          if let data = data,
+                             let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
+                             let arr = json.first as? [[Any]] {
+                              res = arr.compactMap { $0.first as? String }.joined()
+                          }
+                          DispatchQueue.main.async {
+                              if let self = self, i < self.boxes.count { self.boxes[i].translatedText = res }
+                              group.leave()
+                          }
+                      }.resume()
+                  }
+                  group.notify(queue: .main) { [weak self] in self?.isTranslating = false }
+              }
+          }
+
+          struct WebViewWrapper: UIViewRepresentable {
+              @ObservedObject var vm: BrowserViewModel
+              func makeUIView(context: Context) -> WKWebView {
+                  let wv = WKWebView()
+                  wv.allowsBackForwardNavigationGestures = true
+                  vm.webView = wv
+                  if let url = URL(string: vm.urlString) { wv.load(URLRequest(url: url)) }
+                  return wv
+              }
+              func updateUIView(_ uiView: WKWebView, context: Context) {}
+          }
+
+          struct ContentView: View {
+              @StateObject private var vm = BrowserViewModel()
+              @State private var showBar = true
+              var body: some View {
+                  ZStack {
+                      VStack(spacing: 0) {
+                          if showBar {
+                              HStack {
+                                  Button(action: { vm.webView?.goBack() }) { Image(systemName: "chevron.backward").padding(6) }
+                                  TextField("رابط اللعبة...", text: $vm.urlString, onCommit: { vm.loadURL() })
+                                      .textFieldStyle(RoundedBorderTextFieldStyle())
+                                      .autocapitalization(.none)
+                                  Button("ذهاب") { vm.loadURL() }
+                                      .padding(.horizontal, 10).padding(.vertical, 6)
+                                      .background(Color.blue).foregroundColor(.white).cornerRadius(6)
+                              }.padding(8).background(Color(UIColor.secondarySystemBackground))
+                          }
+                          GeometryReader { geo in
+                              ZStack {
+                                  WebViewWrapper(vm: vm)
+                                  if vm.showOverlay {
+                                      Color.black.opacity(0.15).onTapGesture { vm.showOverlay = false }
+                                      ForEach(vm.boxes) { box in
+                                          Text(box.translatedText)
+                                              .font(.system(size: 14, weight: .bold))
+                                              .foregroundColor(.white)
+                                              .multilineTextAlignment(.center)
+                                              .padding(4)
+                                              .background(Color.black.opacity(0.85))
+                                              .cornerRadius(6)
+                                              .frame(width: max(box.rect.width * geo.size.width, 80),
+                                                     height: max(box.rect.height * geo.size.height, 32))
+                                              .position(x: box.rect.midX * geo.size.width,
+                                                        y: box.rect.midY * geo.size.height)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      VStack {
+                          Spacer()
+                          HStack {
+                              Button(action: { showBar.toggle() }) {
+                                  Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                      .padding(12).background(Color.gray.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
+                              }
+                              Spacer()
+                              Button(action: { vm.showOverlay ? (vm.showOverlay = false) : vm.captureAndTranslate() }) {
+                                  HStack {
+                                      Image(systemName: vm.showOverlay ? "xmark.circle.fill" : "doc.text.viewfinder")
+                                      Text(vm.showOverlay ? "إخفاء" : (vm.isTranslating ? "جاري الترجمة..." : "ترجم الشاشة"))
+                                  }
+                                  .font(.system(size: 16, weight: .bold))
+                                  .padding(.horizontal, 16).padding(.vertical, 12)
+                                  .background(vm.showOverlay ? Color.red : Color.blue)
+                                  .foregroundColor(.white).cornerRadius(25)
+                              }.disabled(vm.isTranslating)
+                          }.padding()
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build and Package IPA
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project GameTranslator.xcodeproj -scheme GameTranslator -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          mkdir Payload
+          cp -r build/Build/Products/Release-iphoneos/GameTranslator.app Payload/
+          zip -r GameTranslator.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ready-GameTranslator-IPA
+          path: GameTranslator.ipa
