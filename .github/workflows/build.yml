@@ -49,18 +49,17 @@ jobs:
               }
           }
 
-          struct TranslatedBox: Identifiable {
-              let id = UUID()
-              let originalText: String
-              var translatedText: String
-              let rect: CGRect
-          }
-
           class BrowserViewModel: ObservableObject {
               @Published var urlString: String = "https://www.google.com"
-              @Published var isTranslating: Bool = false
-              @Published var showOverlay: Bool = false
-              @Published var boxes: [TranslatedBox] = []
+              @Published var isAutoTranslating: Bool = false
+              @Published var isEditingRegion: Bool = false
+              @Published var translatedText: String = ""
+              // Default box positioned over the bottom dialogue area
+              @Published var region: CGRect = CGRect(x: 0.12, y: 0.62, width: 0.76, height: 0.25)
+
+              private var lastNormalizedText: String = ""
+              private var isBusy: Bool = false
+              private var timer: Timer?
               weak var webView: WKWebView?
 
               func loadURL() {
@@ -73,79 +72,143 @@ jobs:
                   }
               }
 
-              func captureAndTranslate() {
-                  guard let webView = webView else { return }
-                  isTranslating = true
-                  boxes.removeAll()
-                  webView.takeSnapshot(with: nil) { [weak self] image, _ in
-                      guard let self = self, let cgImage = image?.cgImage else {
-                          self?.isTranslating = false
-                          return
-                      }
-                      self.recognizeText(in: cgImage)
+              func toggleAutoTranslate() {
+                  isAutoTranslating.toggle()
+                  if isAutoTranslating {
+                      isEditingRegion = false
+                      lastNormalizedText = ""
+                      startTimer()
+                      captureAndTranslate(force: true)
+                  } else {
+                      stopTimer()
+                      translatedText = ""
+                      lastNormalizedText = ""
                   }
               }
 
-              private func recognizeText(in cgImage: CGImage) {
-                  let request = VNRecognizeTextRequest { [weak self] req, _ in
-                      guard let self = self, let results = req.results as? [VNRecognizedTextObservation] else {
-                          DispatchQueue.main.async { self?.isTranslating = false }
+              private func startTimer() {
+                  stopTimer()
+                  timer = Timer.scheduledTimer(withTimeInterval: 0.9, repeats: true) { [weak self] _ in
+                      self?.captureAndTranslate(force: false)
+                  }
+              }
+
+              private func stopTimer() {
+                  timer?.invalidate()
+                  timer = nil
+              }
+
+              func captureAndTranslate(force: Bool = false) {
+                  guard let webView = webView, !isBusy else { return }
+                  isBusy = true
+
+                  webView.takeSnapshot(with: nil) { [weak self] image, _ in
+                      guard let self = self, let cgImage = image?.cgImage else {
+                          self?.isBusy = false
                           return
                       }
-                      var temp: [TranslatedBox] = []
-                      for obs in results {
-                          guard let top = obs.topCandidates(1).first else { continue }
-                          let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                          if txt.count < 2 { continue }
-                          let b = obs.boundingBox
-                          let rect = CGRect(x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, width: b.size.width, height: b.size.height)
-                          temp.append(TranslatedBox(originalText: txt, translatedText: "...", rect: rect))
+
+                      let imgW = CGFloat(cgImage.width)
+                      let imgH = CGFloat(cgImage.height)
+                      let cropRect = CGRect(
+                          x: self.region.origin.x * imgW,
+                          y: self.region.origin.y * imgH,
+                          width: self.region.size.width * imgW,
+                          height: self.region.size.height * imgH
+                      ).integral
+
+                      guard let croppedCGImage = cgImage.cropping(to: cropRect) else {
+                          self.isBusy = false
+                          return
                       }
-                      DispatchQueue.main.async {
-                          self.boxes = temp
-                          self.showOverlay = true
-                          self.translateAll()
-                      }
+
+                      self.recognizeText(in: croppedCGImage, force: force)
                   }
+              }
+
+              private func recognizeText(in cgImage: CGImage, force: Bool) {
+                  let request = VNRecognizeTextRequest { [weak self] req, _ in
+                      guard let self = self,
+                            let results = req.results as? [VNRecognizedTextObservation] else {
+                          DispatchQueue.main.async { self?.isBusy = false }
+                          return
+                      }
+
+                      // Sort lines from top to bottom
+                      let sorted = results.sorted { $0.boundingBox.origin.y > $1.boundingBox.origin.y }
+                      var lines: [String] = []
+                      for obs in sorted {
+                          if let top = obs.topCandidates(1).first {
+                              let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                              if txt.count >= 2 {
+                                  lines.append(txt)
+                              }
+                          }
+                      }
+
+                      let fullText = lines.joined(separator: "\n")
+                      let normalized = fullText.lowercased().filter { $0.isLetter || $0.isNumber }
+
+                      if normalized.isEmpty {
+                          DispatchQueue.main.async {
+                              self.translatedText = ""
+                              self.lastNormalizedText = ""
+                              self.isBusy = false
+                          }
+                          return
+                      }
+
+                      if !force && normalized == self.lastNormalizedText {
+                          DispatchQueue.main.async {
+                              self.isBusy = false
+                          }
+                          return
+                      }
+
+                      self.lastNormalizedText = normalized
+                      self.translateText(fullText)
+                  }
+
                   request.recognitionLevel = .accurate
+                  request.usesLanguageCorrection = true
                   request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR"]
+
                   DispatchQueue.global(qos: .userInitiated).async {
                       try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
                   }
               }
 
-              private func translateAll() {
-                  guard !boxes.isEmpty else { isTranslating = false; return }
-                  let group = DispatchGroup()
-                  for i in boxes.indices {
-                      group.enter()
-                      let orig = boxes[i].originalText
-                      guard let enc = orig.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                            let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=\(enc)") else {
-                          group.leave()
-                          continue
-                      }
-                      URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                          var res = orig
-                          if let data = data,
-                             let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
-                             let arr = json.first as? [[Any]] {
-                              res = arr.compactMap { $0.first as? String }.joined()
-                          }
-                          DispatchQueue.main.async {
-                              if let self = self, i < self.boxes.count { self.boxes[i].translatedText = res }
-                              group.leave()
-                          }
-                      }.resume()
+              private func translateText(_ text: String) {
+                  guard let enc = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                        let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=\(enc)") else {
+                      DispatchQueue.main.async { self.isBusy = false }
+                      return
                   }
-                  group.notify(queue: .main) { [weak self] in self?.isTranslating = false }
+
+                  URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                      var res = text
+                      if let data = data,
+                         let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
+                         let arr = json.first as? [[Any]] {
+                          res = arr.compactMap { $0.first as? String }.joined()
+                      }
+                      DispatchQueue.main.async {
+                          guard let self = self else { return }
+                          if self.isAutoTranslating {
+                              self.translatedText = res
+                          }
+                          self.isBusy = false
+                      }
+                  }.resume()
               }
           }
 
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
               func makeUIView(context: Context) -> WKWebView {
-                  let wv = WKWebView()
+                  let config = WKWebViewConfiguration()
+                  config.allowsInlineMediaPlayback = true
+                  let wv = WKWebView(frame: .zero, configuration: config)
                   wv.allowsBackForwardNavigationGestures = true
                   vm.webView = wv
                   if let url = URL(string: vm.urlString) { wv.load(URLRequest(url: url)) }
@@ -157,12 +220,16 @@ jobs:
           struct ContentView: View {
               @StateObject private var vm = BrowserViewModel()
               @State private var showBar = true
+              @State private var dragStartRegion: CGRect? = nil
+              @State private var resizeStartRegion: CGRect? = nil
+
               var body: some View {
                   ZStack {
                       VStack(spacing: 0) {
                           if showBar {
                               HStack {
                                   Button(action: { vm.webView?.goBack() }) { Image(systemName: "chevron.backward").padding(6) }
+                                  Button(action: { vm.webView?.reload() }) { Image(systemName: "arrow.clockwise").padding(6) }
                                   TextField("رابط اللعبة...", text: $vm.urlString, onCommit: { vm.loadURL() })
                                       .textFieldStyle(RoundedBorderTextFieldStyle())
                                       .autocapitalization(.none)
@@ -171,47 +238,125 @@ jobs:
                                       .background(Color.blue).foregroundColor(.white).cornerRadius(6)
                               }.padding(8).background(Color(UIColor.secondarySystemBackground))
                           }
+
                           GeometryReader { geo in
+                              let boxW = vm.region.size.width * geo.size.width
+                              let boxH = vm.region.size.height * geo.size.height
+                              let boxX = (vm.region.origin.x * geo.size.width) + (boxW / 2)
+                              let boxY = (vm.region.origin.y * geo.size.height) + (boxH / 2)
+
                               ZStack {
                                   WebViewWrapper(vm: vm)
-                                  if vm.showOverlay {
-                                      Color.black.opacity(0.15).onTapGesture { vm.showOverlay = false }
-                                      ForEach(vm.boxes) { box in
-                                          Text(box.translatedText)
-                                              .font(.system(size: 14, weight: .bold))
-                                              .foregroundColor(.white)
-                                              .multilineTextAlignment(.center)
-                                              .padding(4)
-                                              .background(Color.black.opacity(0.85))
-                                              .cornerRadius(6)
-                                              .frame(width: max(box.rect.width * geo.size.width, 80),
-                                                     height: max(box.rect.height * geo.size.height, 32))
-                                              .position(x: box.rect.midX * geo.size.width,
-                                                        y: box.rect.midY * geo.size.height)
+
+                                  // Movie Subtitle Overlay (Touch-through enabled)
+                                  if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion {
+                                      Text(vm.translatedText)
+                                          .font(.system(size: 18, weight: .bold))
+                                          .foregroundColor(.white)
+                                          .multilineTextAlignment(.center)
+                                          .padding(.horizontal, 14)
+                                          .padding(.vertical, 10)
+                                          .frame(maxWidth: boxW)
+                                          .background(Color.black.opacity(0.85))
+                                          .cornerRadius(10)
+                                          .position(x: boxX, y: boxY)
+                                          .allowsHitTesting(false)
+                                  }
+
+                                  // Region Selector Editor
+                                  if vm.isEditingRegion {
+                                      ZStack(alignment: .bottomTrailing) {
+                                          Rectangle()
+                                              .fill(Color.green.opacity(0.22))
+                                              .border(Color.green, width: 3)
+                                              .overlay(
+                                                  Text("اسحب الصندوق لتحريكه فوق الحوار\nواسحب الدائرة بالزاوية لتغيير الحجم")
+                                                      .font(.system(size: 14, weight: .bold))
+                                                      .foregroundColor(.white)
+                                                      .multilineTextAlignment(.center)
+                                                      .padding(6)
+                                                      .background(Color.black.opacity(0.7))
+                                                      .cornerRadius(8)
+                                              )
+                                              .gesture(
+                                                  DragGesture()
+                                                      .onChanged { value in
+                                                          if dragStartRegion == nil { dragStartRegion = vm.region }
+                                                          guard let start = dragStartRegion else { return }
+                                                          let dx = value.translation.width / geo.size.width
+                                                          let dy = value.translation.height / geo.size.height
+                                                          let nx = min(max(0.0, start.origin.x + dx), 1.0 - start.size.width)
+                                                          let ny = min(max(0.0, start.origin.y + dy), 1.0 - start.size.height)
+                                                          vm.region.origin = CGPoint(x: nx, y: ny)
+                                                      }
+                                                      .onEnded { _ in dragStartRegion = nil }
+                                              )
+
+                                          // Bottom-Right Resize Handle
+                                          Circle()
+                                              .fill(Color.green)
+                                              .frame(width: 34, height: 34)
+                                              .overlay(Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.black).font(.system(size: 14, weight: .bold)))
+                                              .offset(x: 12, y: 12)
+                                              .gesture(
+                                                  DragGesture()
+                                                      .onChanged { value in
+                                                          if resizeStartRegion == nil { resizeStartRegion = vm.region }
+                                                          guard let start = resizeStartRegion else { return }
+                                                          let dw = value.translation.width / geo.size.width
+                                                          let dh = value.translation.height / geo.size.height
+                                                          let nw = min(max(0.15, start.size.width + dw), 1.0 - start.origin.x)
+                                                          let nh = min(max(0.08, start.size.height + dh), 1.0 - start.origin.y)
+                                                          vm.region.size = CGSize(width: nw, height: nh)
+                                                      }
+                                                      .onEnded { _ in resizeStartRegion = nil }
+                                              )
                                       }
+                                      .frame(width: boxW, height: boxH)
+                                      .position(x: boxX, y: boxY)
                                   }
                               }
                           }
                       }
+
+                      // Floating Bottom Controls
                       VStack {
                           Spacer()
-                          HStack {
+                          HStack(spacing: 10) {
                               Button(action: { showBar.toggle() }) {
                                   Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                      .padding(12).background(Color.gray.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
+                                      .padding(11).background(Color.gray.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
                               }
+
                               Spacer()
-                              Button(action: { vm.showOverlay ? (vm.showOverlay = false) : vm.captureAndTranslate() }) {
-                                  HStack {
-                                      Image(systemName: vm.showOverlay ? "xmark.circle.fill" : "doc.text.viewfinder")
-                                      Text(vm.showOverlay ? "إخفاء" : (vm.isTranslating ? "جاري الترجمة..." : "ترجم الشاشة"))
+
+                              // Select Region Button
+                              Button(action: {
+                                  vm.isEditingRegion.toggle()
+                                  if vm.isEditingRegion { vm.isAutoTranslating = false }
+                              }) {
+                                  HStack(spacing: 6) {
+                                      Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
+                                      Text(vm.isEditingRegion ? "تثبيت المنطقة" : "تحديد المنطقة")
                                   }
-                                  .font(.system(size: 16, weight: .bold))
-                                  .padding(.horizontal, 16).padding(.vertical, 12)
-                                  .background(vm.showOverlay ? Color.red : Color.blue)
-                                  .foregroundColor(.white).cornerRadius(25)
-                              }.disabled(vm.isTranslating)
-                          }.padding()
+                                  .font(.system(size: 14, weight: .bold))
+                                  .padding(.horizontal, 14).padding(.vertical, 10)
+                                  .background(vm.isEditingRegion ? Color.green : Color.orange)
+                                  .foregroundColor(.white).cornerRadius(22)
+                              }
+
+                              // Auto-Translate Toggle Button
+                              Button(action: { vm.toggleAutoTranslate() }) {
+                                  HStack(spacing: 6) {
+                                      Image(systemName: vm.isAutoTranslating ? "pause.circle.fill" : "play.circle.fill")
+                                      Text(vm.isAutoTranslating ? "إيقاف التلقائي" : "ترجمة تلقائية")
+                                  }
+                                  .font(.system(size: 14, weight: .bold))
+                                  .padding(.horizontal, 14).padding(.vertical, 10)
+                                  .background(vm.isAutoTranslating ? Color.red : Color.blue)
+                                  .foregroundColor(.white).cornerRadius(22)
+                              }
+                          }.padding(.horizontal, 12).padding(.bottom, 8)
                       }
                   }
               }
