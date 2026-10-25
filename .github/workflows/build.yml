@@ -19,11 +19,14 @@ jobs:
               platform: iOS
               sources:
                 - App.swift
+              settings:
+                base:
+                  TARGETED_DEVICE_FAMILY: "1,2"
               info:
                 path: Info.plist
                 properties:
                   UILaunchScreen: {}
-                  UIRequiresFullScreen: false
+                  UIRequiresFullScreen: true
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
                     - UIInterfaceOrientationLandscapeLeft
@@ -45,7 +48,10 @@ jobs:
           @main
           struct GameTranslatorApp: App {
               var body: some Scene {
-                  WindowGroup { ContentView() }
+                  WindowGroup {
+                      ContentView()
+                          .statusBar(hidden: false)
+                  }
               }
           }
 
@@ -54,8 +60,7 @@ jobs:
               @Published var isAutoTranslating: Bool = false
               @Published var isEditingRegion: Bool = false
               @Published var translatedText: String = ""
-              // Default box positioned over the bottom dialogue area
-              @Published var region: CGRect = CGRect(x: 0.12, y: 0.62, width: 0.76, height: 0.25)
+              @Published var region: CGRect = CGRect(x: 0.12, y: 0.65, width: 0.76, height: 0.22)
 
               private var lastNormalizedText: String = ""
               private var isBusy: Bool = false
@@ -88,7 +93,7 @@ jobs:
 
               private func startTimer() {
                   stopTimer()
-                  timer = Timer.scheduledTimer(withTimeInterval: 0.9, repeats: true) { [weak self] _ in
+                  timer = Timer.scheduledTimer(withTimeInterval: 0.85, repeats: true) { [weak self] _ in
                       self?.captureAndTranslate(force: false)
                   }
               }
@@ -102,7 +107,8 @@ jobs:
                   guard let webView = webView, !isBusy else { return }
                   isBusy = true
 
-                  webView.takeSnapshot(with: nil) { [weak self] image, _ in
+                  let config = WKSnapshotConfiguration()
+                  webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
                           self?.isBusy = false
                           return
@@ -134,7 +140,6 @@ jobs:
                           return
                       }
 
-                      // Sort lines from top to bottom
                       let sorted = results.sorted { $0.boundingBox.origin.y > $1.boundingBox.origin.y }
                       var lines: [String] = []
                       for obs in sorted {
@@ -171,7 +176,7 @@ jobs:
 
                   request.recognitionLevel = .accurate
                   request.usesLanguageCorrection = true
-                  request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR"]
+                  request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR", "de-DE"]
 
                   DispatchQueue.global(qos: .userInitiated).async {
                       try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
@@ -206,10 +211,18 @@ jobs:
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
               func makeUIView(context: Context) -> WKWebView {
+                  let prefs = WKWebpagePreferences()
+                  prefs.allowsContentJavaScript = true
+                  prefs.preferredContentMode = .desktop
+
                   let config = WKWebViewConfiguration()
+                  config.defaultWebpagePreferences = prefs
                   config.allowsInlineMediaPlayback = true
+                  config.mediaTypesRequiringUserActionForPlayback = []
+
                   let wv = WKWebView(frame: .zero, configuration: config)
                   wv.allowsBackForwardNavigationGestures = true
+                  wv.scrollView.contentInsetAdjustmentBehavior = .never
                   vm.webView = wv
                   if let url = URL(string: vm.urlString) { wv.load(URLRequest(url: url)) }
                   return wv
@@ -227,16 +240,26 @@ jobs:
                   ZStack {
                       VStack(spacing: 0) {
                           if showBar {
-                              HStack {
-                                  Button(action: { vm.webView?.goBack() }) { Image(systemName: "chevron.backward").padding(6) }
-                                  Button(action: { vm.webView?.reload() }) { Image(systemName: "arrow.clockwise").padding(6) }
-                                  TextField("رابط اللعبة...", text: $vm.urlString, onCommit: { vm.loadURL() })
+                              HStack(spacing: 10) {
+                                  Button(action: { vm.webView?.goBack() }) {
+                                      Image(systemName: "chevron.backward").font(.system(size: 18, weight: .semibold)).padding(8)
+                                  }
+                                  Button(action: { vm.webView?.reload() }) {
+                                      Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .semibold)).padding(8)
+                                  }
+                                  TextField("أدخل رابط اللعبة...", text: $vm.urlString, onCommit: { vm.loadURL() })
                                       .textFieldStyle(RoundedBorderTextFieldStyle())
+                                      .font(.system(size: 16))
                                       .autocapitalization(.none)
+                                      .disableAutocorrection(true)
                                   Button("ذهاب") { vm.loadURL() }
-                                      .padding(.horizontal, 10).padding(.vertical, 6)
-                                      .background(Color.blue).foregroundColor(.white).cornerRadius(6)
-                              }.padding(8).background(Color(UIColor.secondarySystemBackground))
+                                      .font(.system(size: 16, weight: .bold))
+                                      .padding(.horizontal, 14).padding(.vertical, 8)
+                                      .background(Color.blue).foregroundColor(.white).cornerRadius(8)
+                              }
+                              .padding(.horizontal, 14)
+                              .padding(.vertical, 8)
+                              .background(Color(UIColor.secondarySystemBackground))
                           }
 
                           GeometryReader { geo in
@@ -248,17 +271,18 @@ jobs:
                               ZStack {
                                   WebViewWrapper(vm: vm)
 
-                                  // Movie Subtitle Overlay (Touch-through enabled)
+                                  // Crisp Movie Subtitle Overlay
                                   if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion {
                                       Text(vm.translatedText)
-                                          .font(.system(size: 18, weight: .bold))
+                                          .font(.system(size: 22, weight: .bold))
                                           .foregroundColor(.white)
+                                          .shadow(color: .black, radius: 2, x: 0, y: 1)
                                           .multilineTextAlignment(.center)
-                                          .padding(.horizontal, 14)
-                                          .padding(.vertical, 10)
+                                          .padding(.horizontal, 18)
+                                          .padding(.vertical, 12)
                                           .frame(maxWidth: boxW)
-                                          .background(Color.black.opacity(0.85))
-                                          .cornerRadius(10)
+                                          .background(Color.black.opacity(0.82))
+                                          .cornerRadius(12)
                                           .position(x: boxX, y: boxY)
                                           .allowsHitTesting(false)
                                   }
@@ -271,11 +295,11 @@ jobs:
                                               .border(Color.green, width: 3)
                                               .overlay(
                                                   Text("اسحب الصندوق لتحريكه فوق الحوار\nواسحب الدائرة بالزاوية لتغيير الحجم")
-                                                      .font(.system(size: 14, weight: .bold))
+                                                      .font(.system(size: 16, weight: .bold))
                                                       .foregroundColor(.white)
                                                       .multilineTextAlignment(.center)
-                                                      .padding(6)
-                                                      .background(Color.black.opacity(0.7))
+                                                      .padding(8)
+                                                      .background(Color.black.opacity(0.75))
                                                       .cornerRadius(8)
                                               )
                                               .gesture(
@@ -292,12 +316,11 @@ jobs:
                                                       .onEnded { _ in dragStartRegion = nil }
                                               )
 
-                                          // Bottom-Right Resize Handle
                                           Circle()
                                               .fill(Color.green)
-                                              .frame(width: 34, height: 34)
-                                              .overlay(Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.black).font(.system(size: 14, weight: .bold)))
-                                              .offset(x: 12, y: 12)
+                                              .frame(width: 38, height: 38)
+                                              .overlay(Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.black).font(.system(size: 16, weight: .bold)))
+                                              .offset(x: 14, y: 14)
                                               .gesture(
                                                   DragGesture()
                                                       .onChanged { value in
@@ -319,44 +342,52 @@ jobs:
                           }
                       }
 
-                      // Floating Bottom Controls
+                      // Floating Bottom Controls (Properly padded for iPad screen)
                       VStack {
                           Spacer()
-                          HStack(spacing: 10) {
-                              Button(action: { showBar.toggle() }) {
+                          HStack(spacing: 12) {
+                              Button(action: { withAnimation { showBar.toggle() } }) {
                                   Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                      .padding(11).background(Color.gray.opacity(0.8)).foregroundColor(.white).clipShape(Circle())
+                                      .font(.system(size: 18, weight: .bold))
+                                      .padding(14)
+                                      .background(Color.gray.opacity(0.85))
+                                      .foregroundColor(.white)
+                                      .clipShape(Circle())
                               }
 
                               Spacer()
 
-                              // Select Region Button
                               Button(action: {
                                   vm.isEditingRegion.toggle()
                                   if vm.isEditingRegion { vm.isAutoTranslating = false }
                               }) {
-                                  HStack(spacing: 6) {
+                                  HStack(spacing: 8) {
                                       Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
                                       Text(vm.isEditingRegion ? "تثبيت المنطقة" : "تحديد المنطقة")
                                   }
-                                  .font(.system(size: 14, weight: .bold))
-                                  .padding(.horizontal, 14).padding(.vertical, 10)
+                                  .font(.system(size: 16, weight: .bold))
+                                  .padding(.horizontal, 18).padding(.vertical, 12)
                                   .background(vm.isEditingRegion ? Color.green : Color.orange)
-                                  .foregroundColor(.white).cornerRadius(22)
+                                  .foregroundColor(.white)
+                                  .cornerRadius(25)
+                                  .shadow(radius: 3)
                               }
 
-                              // Auto-Translate Toggle Button
                               Button(action: { vm.toggleAutoTranslate() }) {
-                                  HStack(spacing: 6) {
+                                  HStack(spacing: 8) {
                                       Image(systemName: vm.isAutoTranslating ? "pause.circle.fill" : "play.circle.fill")
                                       Text(vm.isAutoTranslating ? "إيقاف التلقائي" : "ترجمة تلقائية")
                                   }
-                                  .font(.system(size: 14, weight: .bold))
-                                  .padding(.horizontal, 14).padding(.vertical, 10)
+                                  .font(.system(size: 16, weight: .bold))
+                                  .padding(.horizontal, 18).padding(.vertical, 12)
                                   .background(vm.isAutoTranslating ? Color.red : Color.blue)
-                                  .foregroundColor(.white).cornerRadius(22)
+                                  .foregroundColor(.white)
+                                  .cornerRadius(25)
+                                  .shadow(radius: 3)
                               }
-                          }.padding(.horizontal, 12).padding(.bottom, 8)
+                          }
+                          .padding(.horizontal, 24)
+                          .padding(.bottom, 16)
                       }
                   }
               }
