@@ -158,7 +158,7 @@ jobs:
               @Published var isPrivacyLocked: Bool = false
               @Published var hideSubtitlesTemp: Bool = false
               @Published var gameSpeed: Double = 1.0
-              @Published var ttsMode: Int = 0 // 0: Off, 1: Source Voice, 2: Arabic Voice
+              @Published var ttsMode: Int = 0
               @Published var usePreProcessing: Bool = false
               @Published var useEcoTouchMode: Bool = true
               @Published var mangaCleanBubbleMode: Bool = true
@@ -382,7 +382,6 @@ jobs:
                   }
               }
 
-              // Smart Theater Fullscreen Zoom (Keeps SwiftUI Subtitles & Controls on Top!)
               func toggleGameTheaterZoom() {
                   isGameTheaterZoomed.toggle()
                   let js = """
@@ -507,7 +506,6 @@ jobs:
                   webView?.evaluateJavaScript(muteJS, completionHandler: nil)
               }
 
-              // Save-State Backup, Restore & Clipboard Export/Import
               func backupCurrentSaveState(customName: String) {
                   let js = "JSON.stringify(localStorage);"
                   webView?.evaluateJavaScript(js) { [weak self] result, _ in
@@ -689,7 +687,6 @@ jobs:
                   }
               }
 
-              // Simultaneous Full-Screen / Choices Translate (Does NOT kill Auto-Translate!)
               func toggleFullScreenTranslate() {
                   if isFullScreenTranslated {
                       isFullScreenTranslated = false
@@ -716,7 +713,7 @@ jobs:
                   timer = nil
               }
 
-              // Ultra-Fast 8x8 Pixel Signature Diffing (Skips Vision OCR when dialogue box hasn't visually changed)
+              // FIXED: lowercase context.draw(...)
               private func hasImageChanged(_ cgImage: CGImage) -> Bool {
                   let width = 8
                   let height = 8
@@ -731,7 +728,7 @@ jobs:
                       bitmapInfo: CGImageAlphaInfo.none.rawValue
                   ) else { return true }
 
-                  context.Draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+                  context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
                   if lastPixelSignature.count == pixels.count {
                       var totalDiff = 0
@@ -774,7 +771,6 @@ jobs:
                   return luminance > 0.62
               }
 
-              // Clean OCR Artifacts (e.g., stray border pipes |, _, ~, broken hyphens)
               private func cleanOCRText(_ raw: String) -> String {
                   var cleaned = raw
                       .replacingOccurrences(of: "|", with: " ")
@@ -814,7 +810,6 @@ jobs:
                           return
                       }
 
-                      // Instant Pixel-Diff Check (Saves 85% CPU & Battery)
                       if !force && !self.hasImageChanged(croppedCGImage) {
                           self.unchangedTicks += 1
                           if self.useEcoTouchMode && self.unchangedTicks >= 12 {
@@ -1140,7 +1135,7 @@ jobs:
               }
           }
 
-          // MARK: - WebView Wrapper with Fullscreen Interceptor & Audio Keep-Alive
+          // MARK: - WebView Wrapper
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
               var onTwoFingerTap: () -> Void
@@ -1159,18 +1154,15 @@ jobs:
                   config.defaultWebpagePreferences = prefs
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
-                  // Disable native system fullscreen takeover so SwiftUI overlays NEVER disappear!
                   if #available(iOS 15.4, *) {
                       config.preferences.isElementFullscreenEnabled = false
                   }
 
-                  // Master Script: Fake Fullscreen Interceptor + WebAudio KeepAlive + AdBlock + Touch Hook
                   let masterScript = WKUserScript(
                       source: """
                       (function() {
                           window.open = function() { return null; };
 
-                          // 1. CSS for Fake Fullscreen, HD Enhancer & AdBlock
                           var style = document.createElement('style');
                           style.id = 'ultra-hd-enhancer';
                           style.innerHTML = `
@@ -1194,7 +1186,6 @@ jobs:
                           `;
                           document.documentElement.appendChild(style);
 
-                          // 2. Intercept HTML5 Fullscreen API so game stays inside WebView under SwiftUI overlays
                           var fakeFullscreenElement = null;
                           var enterFakeFS = function() {
                               var el = (this === window || this === document) ? document.documentElement : this;
@@ -1231,7 +1222,6 @@ jobs:
                               Object.defineProperty(document, 'webkitFullscreenEnabled', { get: function() { return true; } });
                           } catch(e) {}
 
-                          // 3. WebAudio Auto-Resume (Fixes iOS Safari/WebGL sound muting)
                           var activeContexts = [];
                           var OrigAudioCtx = window.AudioContext || window.webkitAudioContext;
                           if (OrigAudioCtx) {
@@ -1245,7 +1235,6 @@ jobs:
                               window.webkitAudioContext = PatchedAudioCtx;
                           }
 
-                          // 4. Notify Swift on Touch/Key & Resume Audio
                           var notifyTouch = function() {
                               activeContexts.forEach(function(ctx) {
                                   if (ctx && ctx.state === 'suspended') { ctx.resume(); }
@@ -1424,7 +1413,6 @@ jobs:
               }
           }
 
-          // Draggable Virtual Gamepad
           struct VirtualHotkeysOverlay: View {
               @ObservedObject var vm: BrowserViewModel
               let screenSize: CGSize
@@ -1528,6 +1516,147 @@ jobs:
               }
           }
 
+          // Helper View for Control Center Grid Tiles
+          struct HubTileButton: View {
+              let icon: String
+              let title: String
+              let color: Color
+              let isActive: Bool
+              let action: () -> Void
+
+              var body: some View {
+                  Button(action: action) {
+                      VStack(spacing: 6) {
+                          Image(systemName: icon)
+                              .font(.system(size: 18, weight: .bold))
+                              .foregroundColor(isActive ? color : .white)
+                          Text(title)
+                              .font(.system(size: 11, weight: .bold, design: .rounded))
+                              .foregroundColor(.white)
+                              .lineLimit(1)
+                              .minimumScaleFactor(0.8)
+                      }
+                      .frame(maxWidth: .infinity)
+                      .frame(height: 64)
+                      .background(isActive ? Color.white.opacity(0.22) : Color.white.opacity(0.10))
+                      .cornerRadius(14)
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 14)
+                              .stroke(isActive ? color.opacity(0.6) : Color.clear, lineWidth: 1.2)
+                      )
+                  }
+              }
+          }
+
+          // Extracted Control Hub Modal for fast Xcode compilation
+          struct ControlHubModalView: View {
+              @ObservedObject var vm: BrowserViewModel
+              let screenWidth: CGFloat
+              @Binding var showBar: Bool
+              @Binding var showControlHub: Bool
+              @Binding var showSaveStatesSheet: Bool
+              @Binding var showHistorySheet: Bool
+              @Binding var showBookmarksSheet: Bool
+              @Binding var showSettingsSheet: Bool
+
+              var body: some View {
+                  ZStack {
+                      Color.black.opacity(0.45)
+                          .ignoresSafeArea()
+                          .onTapGesture { withAnimation(.spring()) { showControlHub = false } }
+
+                      VStack(spacing: 14) {
+                          HStack {
+                              Text("مركز أدوات المترجم ⚡")
+                                  .font(.system(size: 16, weight: .heavy, design: .rounded))
+                                  .foregroundColor(.white)
+                              Spacer()
+                              Button(action: { withAnimation(.spring()) { showControlHub = false } }) {
+                                  Image(systemName: "xmark.circle.fill")
+                                      .font(.system(size: 22))
+                                      .foregroundColor(.white.opacity(0.75))
+                              }
+                          }
+                          .padding(.horizontal, 6)
+
+                          let cols = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
+                          LazyVGrid(columns: cols, spacing: 10) {
+                              HubTileButton(icon: "safari.fill", title: "الرابط", color: showBar ? .cyan : .white, isActive: showBar) {
+                                  withAnimation { showBar.toggle(); showControlHub = false }
+                              }
+                              HubTileButton(icon: "paintpalette.fill", title: "لون الخط", color: vm.activeSubtitleColor, isActive: true) {
+                                  vm.cycleSubtitleColor()
+                              }
+                              HubTileButton(icon: "gamecontroller.fill", title: "يد تحكم", color: vm.showVirtualKeys ? .orange : .white, isActive: vm.showVirtualKeys) {
+                                  withAnimation { vm.showVirtualKeys.toggle(); showControlHub = false }
+                              }
+                              HubTileButton(icon: "bolt.fill", title: "السرعة \(String(format: "%g", vm.gameSpeed))x", color: vm.gameSpeed > 1.0 ? .orange : .white, isActive: vm.gameSpeed > 1.0) {
+                                  vm.cycleGameSpeed()
+                              }
+                              HubTileButton(icon: vm.ttsMode == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", title: vm.ttsMode == 0 ? "النطق: مغلق" : (vm.ttsMode == 1 ? "نطق EN" : "نطق عربي"), color: vm.ttsMode > 0 ? .green : .white, isActive: vm.ttsMode > 0) {
+                                  vm.cycleTTSMode()
+                              }
+                              HubTileButton(icon: "character.book.closed.fill", title: "قاموس A/ع", color: vm.showDualSubtitles ? .cyan : .white, isActive: vm.showDualSubtitles) {
+                                  vm.showDualSubtitles.toggle()
+                              }
+                              HubTileButton(icon: "externaldrive.fill.badge.checkmark", title: "التختيمات", color: .green, isActive: false) {
+                                  showControlHub = false; showSaveStatesSheet = true
+                              }
+                              HubTileButton(icon: "clock.arrow.circlepath", title: "السجل", color: .cyan, isActive: false) {
+                                  showControlHub = false; showHistorySheet = true
+                              }
+                              HubTileButton(icon: "star.fill", title: "المفضلة", color: .yellow, isActive: false) {
+                                  showControlHub = false; showBookmarksSheet = true
+                              }
+                              HubTileButton(icon: vm.isAutoScrolling ? "pause.circle.fill" : "arrow.down.circle.fill", title: "تمرير مانجا", color: vm.isAutoScrolling ? .green : .white, isActive: vm.isAutoScrolling) {
+                                  vm.toggleAutoScroll(); showControlHub = false
+                              }
+                              HubTileButton(icon: "sparkles", title: "وضوح HD", color: vm.isHDEnhanced ? .yellow : .white, isActive: vm.isHDEnhanced) {
+                                  vm.toggleHDEnhancer()
+                              }
+                              HubTileButton(icon: "gearshape.fill", title: "الإعدادات", color: vm.useGeminiAI ? .green : .white, isActive: vm.useGeminiAI) {
+                                  showControlHub = false; showSettingsSheet = true
+                              }
+                          }
+
+                          HStack(spacing: 10) {
+                              Button(action: { vm.webView?.goBack(); showControlHub = false }) {
+                                  HStack(spacing: 4) {
+                                      Image(systemName: "arrow.uturn.backward")
+                                      Text("رجوع بالمتصفح")
+                                  }
+                                  .font(.system(size: 13, weight: .bold))
+                                  .foregroundColor(.white)
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 10)
+                                  .background(Color.white.opacity(0.15))
+                                  .cornerRadius(10)
+                              }
+
+                              Button(action: { showControlHub = false; withAnimation { vm.togglePrivacyLock() } }) {
+                                  HStack(spacing: 4) {
+                                      Image(systemName: "lock.shield.fill")
+                                      Text("درع الخصوصية الفوري")
+                                  }
+                                  .font(.system(size: 13, weight: .bold))
+                                  .foregroundColor(.white)
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 10)
+                                  .background(Color.red.opacity(0.75))
+                                  .cornerRadius(10)
+                              }
+                          }
+                      }
+                      .padding(16)
+                      .frame(width: min(screenWidth - 32, 390))
+                      .background(.ultraThinMaterial)
+                      .cornerRadius(24)
+                      .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.25), lineWidth: 1))
+                      .shadow(color: .black.opacity(0.6), radius: 20)
+                  }
+              }
+          }
+
           // MARK: - Main ContentView
           struct ContentView: View {
               @StateObject private var vm = BrowserViewModel()
@@ -1613,12 +1742,10 @@ jobs:
                                       }
                                   }
 
-                                  // 1. Cinema Region Subtitle Overlay
                                   if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion && !vm.hideSubtitlesTemp {
                                       SubtitleOverlayView(vm: vm, boxW: boxW, screenW: geo.size.width, subX: subX, subY: subY)
                                   }
 
-                                  // 2. Smart Full-Screen / Choices Overlay (Works Simultaneously!)
                                   if vm.isFullScreenTranslated && !vm.hideSubtitlesTemp {
                                       ForEach(vm.screenBoxes) { box in
                                           Text(box.translatedText)
@@ -1647,12 +1774,10 @@ jobs:
                                       }
                                   }
 
-                                  // 3. Draggable Virtual PC Gamepad
                                   if vm.showVirtualKeys {
                                       VirtualHotkeysOverlay(vm: vm, screenSize: geo.size)
                                   }
 
-                                  // 4. Region & Subtitle Target Editors
                                   if vm.isEditingRegion {
                                       ZStack(alignment: .bottomTrailing) {
                                           RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -1737,7 +1862,6 @@ jobs:
                                       )
                                   }
 
-                                  // 5. Status Toast Notification (Top)
                                   if !vm.statusToast.isEmpty {
                                       VStack {
                                           Text(vm.statusToast)
@@ -1754,121 +1878,22 @@ jobs:
                                       .allowsHitTesting(false)
                                   }
 
-                                  // 6. Control Hub Grid Modal (Opens when tapping ⊞)
                                   if showControlHub && !vm.isPrivacyLocked {
-                                      ZStack {
-                                          Color.black.opacity(0.45)
-                                              .ignoresSafeArea()
-                                              .onTapGesture { withAnimation(.spring()) { showControlHub = false } }
-
-                                          VStack(spacing: 14) {
-                                              HStack {
-                                                  Text("مركز أدوات المترجم ⚡")
-                                                      .font(.system(size: 16, weight: .heavy, design: .rounded))
-                                                      .foregroundColor(.white)
-                                                  Spacer()
-                                                  Button(action: { withAnimation(.spring()) { showControlHub = false } }) {
-                                                      Image(systemName: "xmark.circle.fill")
-                                                          .font(.system(size: 22))
-                                                          .foregroundColor(.white.opacity(0.75))
-                                                  }
-                                              }
-                                              .padding(.horizontal, 6)
-
-                                              let cols = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
-                                              LazyVGrid(columns: cols, spacing: 10) {
-                                                  // 1. URL Bar
-                                                  HubTileButton(icon: "safari.fill", title: "الرابط", color: showBar ? .cyan : .white, isActive: showBar) {
-                                                      withAnimation { showBar.toggle(); showControlHub = false }
-                                                  }
-                                                  // 2. Color Cycle
-                                                  HubTileButton(icon: "paintpalette.fill", title: "لون الخط", color: vm.activeSubtitleColor, isActive: true) {
-                                                      vm.cycleSubtitleColor()
-                                                  }
-                                                  // 3. Gamepad
-                                                  HubTileButton(icon: "gamecontroller.fill", title: "يد تحكم", color: vm.showVirtualKeys ? .orange : .white, isActive: vm.showVirtualKeys) {
-                                                      withAnimation { vm.showVirtualKeys.toggle(); showControlHub = false }
-                                                  }
-                                                  // 4. Speedhack
-                                                  HubTileButton(icon: "bolt.fill", title: "السرعة \(String(format: "%g", vm.gameSpeed))x", color: vm.gameSpeed > 1.0 ? .orange : .white, isActive: vm.gameSpeed > 1.0) {
-                                                      vm.cycleGameSpeed()
-                                                  }
-                                                  // 5. Voice TTS
-                                                  HubTileButton(icon: vm.ttsMode == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", title: vm.ttsMode == 0 ? "النطق: مغلق" : (vm.ttsMode == 1 ? "نطق EN" : "نطق عربي"), color: vm.ttsMode > 0 ? .green : .white, isActive: vm.ttsMode > 0) {
-                                                      vm.cycleTTSMode()
-                                                  }
-                                                  // 6. Dual Subtitles
-                                                  HubTileButton(icon: "character.book.closed.fill", title: "قاموس A/ع", color: vm.showDualSubtitles ? .cyan : .white, isActive: vm.showDualSubtitles) {
-                                                      vm.showDualSubtitles.toggle()
-                                                  }
-                                                  // 7. Save States
-                                                  HubTileButton(icon: "externaldrive.fill.badge.checkmark", title: "التختيمات", color: .green, isActive: false) {
-                                                      showControlHub = false; showSaveStatesSheet = true
-                                                  }
-                                                  // 8. History
-                                                  HubTileButton(icon: "clock.arrow.circlepath", title: "السجل", color: .cyan, isActive: false) {
-                                                      showControlHub = false; showHistorySheet = true
-                                                  }
-                                                  // 9. Bookmarks
-                                                  HubTileButton(icon: "star.fill", title: "المفضلة", color: .yellow, isActive: false) {
-                                                      showControlHub = false; showBookmarksSheet = true
-                                                  }
-                                                  // 10. Auto Scroll
-                                                  HubTileButton(icon: vm.isAutoScrolling ? "pause.circle.fill" : "arrow.down.circle.fill", title: "تمرير مانجا", color: vm.isAutoScrolling ? .green : .white, isActive: vm.isAutoScrolling) {
-                                                      vm.toggleAutoScroll(); showControlHub = false
-                                                  }
-                                                  // 11. HD Filter
-                                                  HubTileButton(icon: "sparkles", title: "وضوح HD", color: vm.isHDEnhanced ? .yellow : .white, isActive: vm.isHDEnhanced) {
-                                                      vm.toggleHDEnhancer()
-                                                  }
-                                                  // 12. Settings
-                                                  HubTileButton(icon: "gearshape.fill", title: "الإعدادات", color: vm.useGeminiAI ? .green : .white, isActive: vm.useGeminiAI) {
-                                                      showControlHub = false; showSettingsSheet = true
-                                                  }
-                                              }
-
-                                              HStack(spacing: 10) {
-                                                  Button(action: { vm.webView?.goBack(); showControlHub = false }) {
-                                                      HStack(spacing: 4) {
-                                                          Image(systemName: "arrow.uturn.backward")
-                                                          Text("رجوع بالمتصفح")
-                                                      }
-                                                      .font(.system(size: 13, weight: .bold))
-                                                      .foregroundColor(.white)
-                                                      .frame(maxWidth: .infinity)
-                                                      .padding(.vertical, 10)
-                                                      .background(Color.white.opacity(0.15))
-                                                      .cornerRadius(10)
-                                                  }
-
-                                                  Button(action: { showControlHub = false; withAnimation { vm.togglePrivacyLock() } }) {
-                                                      HStack(spacing: 4) {
-                                                          Image(systemName: "lock.shield.fill")
-                                                          Text("درع الخصوصية الفوري")
-                                                      }
-                                                      .font(.system(size: 13, weight: .bold))
-                                                      .foregroundColor(.white)
-                                                      .frame(maxWidth: .infinity)
-                                                      .padding(.vertical, 10)
-                                                      .background(Color.red.opacity(0.75))
-                                                      .cornerRadius(10)
-                                                  }
-                                              }
-                                          }
-                                          .padding(16)
-                                          .frame(width: min(geo.size.width - 32, 390))
-                                          .background(.ultraThinMaterial)
-                                          .cornerRadius(24)
-                                          .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.25), lineWidth: 1))
-                                          .shadow(color: .black.opacity(0.6), radius: 20)
-                                      }
+                                      ControlHubModalView(
+                                          vm: vm,
+                                          screenWidth: geo.size.width,
+                                          showBar: $showBar,
+                                          showControlHub: $showControlHub,
+                                          showSaveStatesSheet: $showSaveStatesSheet,
+                                          showHistorySheet: $showHistorySheet,
+                                          showBookmarksSheet: $showBookmarksSheet,
+                                          showSettingsSheet: $showSettingsSheet
+                                      )
                                   }
 
-                                  // 7. Compact Floating Orb / Mini-Capsule (Replaces Giant Bottom Bar!)
                                   if !vm.isPrivacyLocked {
                                       Group {
                                           if isOrbCollapsed {
-                                              // Mode A: Tiny Draggable Assistive Orb
                                               Button(action: { withAnimation(.spring()) { isOrbCollapsed = false } }) {
                                                   ZStack {
                                                       Circle()
@@ -1893,9 +1918,7 @@ jobs:
                                                   }
                                               }
                                           } else {
-                                              // Mode B: Compact Favorite Actions Capsule (Only 5 Core Icons + Collapse)
                                               HStack(spacing: 8) {
-                                                  // 1. Play / Pause Auto-Translate
                                                   Button(action: { vm.toggleAutoTranslate() }) {
                                                       HStack(spacing: 5) {
                                                           Image(systemName: vm.isAutoTranslating ? "pause.fill" : "play.fill")
@@ -1915,7 +1938,6 @@ jobs:
                                                       .clipShape(Capsule())
                                                   }
 
-                                                  // 2. Region Selector
                                                   Button(action: {
                                                       withAnimation(.spring()) {
                                                           vm.isEditingRegion.toggle()
@@ -1930,7 +1952,6 @@ jobs:
                                                           .clipShape(Circle())
                                                   }
 
-                                                  // 3. Instant Screen / Choices Translate
                                                   Button(action: { vm.toggleFullScreenTranslate() }) {
                                                       Image(systemName: vm.isFullScreenTranslated ? "xmark.viewfinder" : "doc.text.viewfinder")
                                                           .font(.system(size: 15, weight: .bold))
@@ -1940,7 +1961,6 @@ jobs:
                                                           .clipShape(Circle())
                                                   }
 
-                                                  // 4. Smart Game Fullscreen Zoom (Fixes Fullscreen Issue!)
                                                   Button(action: { vm.toggleGameTheaterZoom() }) {
                                                       Image(systemName: vm.isGameTheaterZoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                                                           .font(.system(size: 14, weight: .bold))
@@ -1950,7 +1970,6 @@ jobs:
                                                           .clipShape(Circle())
                                                   }
 
-                                                  // 5. Open Control Center Grid Hub (⊞)
                                                   Button(action: { withAnimation(.spring()) { showControlHub.toggle() } }) {
                                                       Image(systemName: "square.grid.2x2.fill")
                                                           .font(.system(size: 15, weight: .bold))
@@ -1960,7 +1979,6 @@ jobs:
                                                           .clipShape(Circle())
                                                   }
 
-                                                  // 6. Collapse to Tiny Circle
                                                   Button(action: { withAnimation(.spring()) { isOrbCollapsed = true; showControlHub = false } }) {
                                                       Image(systemName: "chevron.down.circle.fill")
                                                           .font(.system(size: 16, weight: .bold))
@@ -1994,7 +2012,6 @@ jobs:
                           }
                       }
 
-                      // 8. Instant Privacy Boss Screen Shield
                       if vm.isPrivacyLocked {
                           ZStack {
                               Rectangle()
@@ -2020,7 +2037,6 @@ jobs:
                           }
                       }
                   }
-                  // Sheet 1: Bookmarks
                   .sheet(isPresented: $showBookmarksSheet) {
                       NavigationView {
                           VStack {
@@ -2055,7 +2071,6 @@ jobs:
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
                   }
-                  // Sheet 2: Save-State Backup Vault (With Clipboard Export/Import!)
                   .sheet(isPresented: $showSaveStatesSheet) {
                       NavigationView {
                           VStack {
@@ -2127,7 +2142,6 @@ jobs:
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
                   }
-                  // Sheet 3: Dialogue History
                   .sheet(isPresented: $showHistorySheet) {
                       NavigationView {
                           List {
@@ -2164,7 +2178,6 @@ jobs:
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
                   }
-                  // Sheet 4: Advanced Settings, Colors, Speed & Glossary
                   .sheet(isPresented: $showSettingsSheet) {
                       NavigationView {
                           Form {
@@ -2246,38 +2259,6 @@ jobs:
                           .toolbar { Button("تم") { showSettingsSheet = false } }
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
-                  }
-              }
-          }
-
-          // Helper View for Control Center Grid Tiles
-          struct HubTileButton: View {
-              let icon: String
-              let title: String
-              let color: Color
-              let isActive: Bool
-              let action: () -> Void
-
-              var body: some View {
-                  Button(action: action) {
-                      VStack(spacing: 6) {
-                          Image(systemName: icon)
-                              .font(.system(size: 18, weight: .bold))
-                              .foregroundColor(isActive ? color : .white)
-                          Text(title)
-                              .font(.system(size: 11, weight: .bold, design: .rounded))
-                              .foregroundColor(.white)
-                              .lineLimit(1)
-                              .minimumScaleFactor(0.8)
-                      }
-                      .frame(maxWidth: .infinity)
-                      .frame(height: 64)
-                      .background(isActive ? Color.white.opacity(0.22) : Color.white.opacity(0.10))
-                      .cornerRadius(14)
-                      .overlay(
-                          RoundedRectangle(cornerRadius: 14)
-                              .stroke(isActive ? color.opacity(0.6) : Color.clear, lineWidth: 1.2)
-                      )
                   }
               }
           }
