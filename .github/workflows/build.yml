@@ -51,6 +51,7 @@ jobs:
 
           cat << 'EOF' > App.swift
           import SwiftUI
+          import UIKit
           import WebKit
           import Vision
           import AVFoundation
@@ -149,6 +150,7 @@ jobs:
               @Published var isEditingRegion: Bool = false
               @Published var isHDEnhanced: Bool = true
               @Published var isAutoScrolling: Bool = false
+              @Published var isGameTheaterZoomed: Bool = false
               @Published var scrollSpeed: Double = 1.5
 
               // Advanced Toggles & Speed Settings
@@ -157,15 +159,16 @@ jobs:
               @Published var hideSubtitlesTemp: Bool = false
               @Published var gameSpeed: Double = 1.0
               @Published var ttsMode: Int = 0 // 0: Off, 1: Source Voice, 2: Arabic Voice
-              @Published var usePreProcessing: Bool = false // Off by default for faster OCR
+              @Published var usePreProcessing: Bool = false
               @Published var useEcoTouchMode: Bool = true
               @Published var mangaCleanBubbleMode: Bool = true
               @Published var isScannerSleeping: Bool = false
+              @Published var statusToast: String = ""
+
               @Published var useFastOCR: Bool {
                   didSet { UserDefaults.standard.set(useFastOCR, forKey: "fast_ocr") }
               }
               @Published var ocrLanguageMode: Int {
-                  // 0: English/Latin (Fastest), 1: Asian + English (Manga/JRPG)
                   didSet { UserDefaults.standard.set(ocrLanguageMode, forKey: "ocr_lang_mode") }
               }
 
@@ -244,8 +247,10 @@ jobs:
 
               private var translationCache: [String: String] = [:]
               private var lastNormalizedText: String = ""
+              private var lastPixelSignature: [UInt8] = []
               private var unchangedTicks: Int = 0
               private var isBusy: Bool = false
+              private var isFullScreenBusy: Bool = false
               private var timer: Timer?
               private var scrollTimer: Timer?
               private let synthesizer = AVSpeechSynthesizer()
@@ -261,7 +266,6 @@ jobs:
               }
 
               init() {
-                  // Ensure TTS plays even if device is on silent switch and mixes with game audio
                   try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
                   try? AVAudioSession.sharedInstance().setActive(true)
 
@@ -330,6 +334,17 @@ jobs:
                   }
               }
 
+              func showToast(_ message: String) {
+                  DispatchQueue.main.async {
+                      withAnimation { self.statusToast = message }
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                          if self.statusToast == message {
+                              withAnimation { self.statusToast = "" }
+                          }
+                      }
+                  }
+              }
+
               private func saveCustomColor(_ color: Color) {
                   let uiColor = UIColor(color)
                   var r: CGFloat = 1, g: CGFloat = 1, b: CGFloat = 1, a: CGFloat = 1
@@ -343,6 +358,8 @@ jobs:
 
               func cycleSubtitleColor() {
                   colorPresetIndex = (colorPresetIndex + 1) % 6
+                  let preset = SubColorPreset(rawValue: colorPresetIndex) ?? .gold
+                  showToast("لون الترجمة: \(preset.name)")
               }
 
               private func saveRect(_ r: CGRect, prefix: String) {
@@ -360,24 +377,70 @@ jobs:
                       formatted = "https://" + formatted
                   }
                   if let url = URL(string: formatted) {
+                      isGameTheaterZoomed = false
                       webView?.load(URLRequest(url: url))
                   }
               }
 
-              // Fast wake-up when user taps screen
+              // Smart Theater Fullscreen Zoom (Keeps SwiftUI Subtitles & Controls on Top!)
+              func toggleGameTheaterZoom() {
+                  isGameTheaterZoomed.toggle()
+                  let js = """
+                  (function() {
+                      var styleId = 'ultra-theater-zoom-style';
+                      var existing = document.getElementById(styleId);
+                      if (\(isGameTheaterZoomed ? "true" : "false")) {
+                          var target = document.querySelector('iframe[src*="html"], iframe[id*="game"], .game_frame iframe, iframe, canvas');
+                          if (target) {
+                              target.classList.add('ultra-forced-fullscreen');
+                          }
+                          if (!existing) {
+                              var st = document.createElement('style');
+                              st.id = styleId;
+                              st.innerHTML = `
+                                  html, body { overflow: hidden !important; background: #000 !important; margin: 0 !important; padding: 0 !important; }
+                                  .ultra-forced-fullscreen, .game_frame, #game_drop {
+                                      position: fixed !important;
+                                      top: 0 !important;
+                                      left: 0 !important;
+                                      width: 100vw !important;
+                                      height: 100vh !important;
+                                      max-width: 100vw !important;
+                                      max-height: 100vh !important;
+                                      z-index: 2147483646 !important;
+                                      background: #000 !important;
+                                      border: none !important;
+                                      margin: 0 !important;
+                                      padding: 0 !important;
+                                  }
+                              `;
+                              document.head.appendChild(st);
+                          }
+                      } else {
+                          if (existing) existing.remove();
+                          document.querySelectorAll('.ultra-forced-fullscreen, .ultra-fake-fullscreen').forEach(function(el) {
+                              el.classList.remove('ultra-forced-fullscreen');
+                              el.classList.remove('ultra-fake-fullscreen');
+                          });
+                      }
+                  })();
+                  """
+                  webView?.evaluateJavaScript(js, completionHandler: nil)
+                  showToast(isGameTheaterZoomed ? "تم تكبير شاشة اللعبة ⛶" : "تم إرجاع حجم الشاشة الطبيعي")
+              }
+
               func notifyUserInteraction() {
                   unchangedTicks = 0
                   if isScannerSleeping {
                       isScannerSleeping = false
                   }
                   if isAutoTranslating {
-                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
                           self?.captureAndTranslate(force: false)
                       }
                   }
               }
 
-              // Virtual PC Key Dispatcher
               func sendPCKey(key: String, code: String, keyCode: Int) {
                   let js = """
                   (function() {
@@ -398,12 +461,12 @@ jobs:
                   notifyUserInteraction()
               }
 
-              // True Engine Game Speedhack Controller (Timeout + Interval + Performance.now)
               func cycleGameSpeed() {
                   if gameSpeed == 1.0 { gameSpeed = 1.5 }
                   else if gameSpeed == 1.5 { gameSpeed = 2.0 }
                   else { gameSpeed = 1.0 }
                   applyGameSpeed()
+                  showToast("سرعة اللعبة: \(String(format: "%g", gameSpeed))x ⚡")
               }
 
               func applyGameSpeed() {
@@ -438,14 +501,13 @@ jobs:
                   webView?.evaluateJavaScript(js, completionHandler: nil)
               }
 
-              // Privacy Boss Button
               func togglePrivacyLock() {
                   isPrivacyLocked.toggle()
                   let muteJS = "document.querySelectorAll('video, audio').forEach(function(e) { e.muted = \(isPrivacyLocked ? "true" : "false"); });"
                   webView?.evaluateJavaScript(muteJS, completionHandler: nil)
               }
 
-              // Safe Base64 Save-State Backup & Restore
+              // Save-State Backup, Restore & Clipboard Export/Import
               func backupCurrentSaveState(customName: String) {
                   let js = "JSON.stringify(localStorage);"
                   webView?.evaluateJavaScript(js) { [weak self] result, _ in
@@ -457,8 +519,32 @@ jobs:
                       let item = SaveStateItem(title: title, domain: host, jsonStorage: jsonStr, dateString: formatter.string(from: Date()))
                       DispatchQueue.main.async {
                           self.saveStates.insert(item, at: 0)
+                          self.showToast("تم حفظ التختيمة بنجاح 💾")
                       }
                   }
+              }
+
+              func exportSaveStateToClipboard(_ item: SaveStateItem) {
+                  if let data = try? JSONEncoder().encode(item) {
+                      UIPasteboard.general.string = "GTULTRA_SAVE:" + data.base64EncodedString()
+                      showToast("تم نسخ كود التختيمة للحافظة 📋")
+                  }
+              }
+
+              func importSaveStateFromClipboard() {
+                  guard let raw = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                        raw.hasPrefix("GTULTRA_SAVE:") else {
+                      showToast("لا يوجد كود تختيمة صالح في الحافظة ⚠️")
+                      return
+                  }
+                  let b64 = String(raw.dropFirst("GTULTRA_SAVE:".count))
+                  guard let data = Data(base64Encoded: b64),
+                        let decoded = try? JSONDecoder().decode(SaveStateItem.self, from: data) else {
+                      showToast("تعذر قراءة كود التختيمة ⚠️")
+                      return
+                  }
+                  saveStates.insert(decoded, at: 0)
+                  showToast("تم استيراد التختيمة بنجاح 📥")
               }
 
               func restoreSaveState(_ item: SaveStateItem) {
@@ -478,15 +564,17 @@ jobs:
                   })();
                   """
                   webView?.evaluateJavaScript(js, completionHandler: nil)
+                  showToast("جاري استرجاع التختيمة... 🔄")
               }
 
-              // Voice-Over TTS
               func cycleTTSMode() {
                   ttsMode = (ttsMode + 1) % 3
                   if ttsMode == 0 {
                       synthesizer.stopSpeaking(at: .immediate)
+                      showToast("النطق الصوتي: متوقف 🔇")
                   } else {
                       speakCurrentDialogue()
+                      showToast(ttsMode == 1 ? "النطق الصوتي: إنجليزي 🔊" : "النطق الصوتي: عربي 🔊")
                   }
               }
 
@@ -501,7 +589,6 @@ jobs:
                   synthesizer.speak(utterance)
               }
 
-              // Tap-to-Define Word Lookup
               func lookupWord(_ rawWord: String) {
                   let clean = rawWord.trimmingCharacters(in: .punctuationCharacters.union(.whitespacesAndNewlines))
                   guard !clean.isEmpty else { return }
@@ -525,11 +612,13 @@ jobs:
                   let finalTitle = cleanTitle.isEmpty ? (webView?.title ?? urlString) : cleanTitle
                   let currentURL = webView?.url?.absoluteString ?? urlString
                   bookmarks.insert(BookmarkItem(title: finalTitle, url: currentURL), at: 0)
+                  showToast("تمت الإضافة للمفضلة ⭐")
               }
 
               func toggleHDEnhancer() {
                   isHDEnhanced.toggle()
                   applyHDFilter()
+                  showToast(isHDEnhanced ? "فلتر الوضوح HD: مفعل ✨" : "فلتر الوضوح HD: متوقف")
               }
 
               func applyHDFilter() {
@@ -569,50 +658,53 @@ jobs:
                           guard let self = self, let wv = self.webView else { return }
                           wv.evaluateJavaScript("window.scrollBy(0, \(self.scrollSpeed));", completionHandler: nil)
                       }
+                      showToast("التمرير التلقائي للمانجا: مفعل ⬇️")
                   } else {
                       scrollTimer?.invalidate()
                       scrollTimer = nil
+                      showToast("التمرير التلقائي: متوقف")
                   }
               }
 
               func toggleAutoTranslate() {
                   isAutoTranslating.toggle()
                   if isAutoTranslating {
-                      isFullScreenTranslated = false
-                      screenBoxes.removeAll()
                       isEditingRegion = false
                       lastNormalizedText = ""
+                      lastPixelSignature = []
                       unchangedTicks = 0
                       isScannerSleeping = false
                       startTimer()
                       captureAndTranslate(force: true)
+                      showToast("الترجمة التلقائية: تعمل ▶️")
                   } else {
                       stopTimer()
                       translatedText = ""
                       currentOriginalText = ""
                       speakerName = ""
                       lastNormalizedText = ""
+                      lastPixelSignature = []
                       isScannerSleeping = false
+                      showToast("الترجمة التلقائية: متوقفة ⏸️")
                   }
               }
 
+              // Simultaneous Full-Screen / Choices Translate (Does NOT kill Auto-Translate!)
               func toggleFullScreenTranslate() {
                   if isFullScreenTranslated {
                       isFullScreenTranslated = false
                       screenBoxes.removeAll()
                   } else {
-                      isAutoTranslating = false
-                      stopTimer()
                       isEditingRegion = false
                       isFullScreenTranslated = true
                       captureFullScreenOnce()
+                      showToast("جاري مسح وترجمة الشاشة بالكامل... 📸")
                   }
               }
 
-              // Turbo Timer (0.42s instead of 1.0s)
               private func startTimer() {
                   stopTimer()
-                  timer = Timer.scheduledTimer(withTimeInterval: 0.42, repeats: true) { [weak self] _ in
+                  timer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
                       guard let self = self else { return }
                       if self.useEcoTouchMode && self.isScannerSleeping { return }
                       self.captureAndTranslate(force: false)
@@ -622,6 +714,37 @@ jobs:
               private func stopTimer() {
                   timer?.invalidate()
                   timer = nil
+              }
+
+              // Ultra-Fast 8x8 Pixel Signature Diffing (Skips Vision OCR when dialogue box hasn't visually changed)
+              private func hasImageChanged(_ cgImage: CGImage) -> Bool {
+                  let width = 8
+                  let height = 8
+                  var pixels = [UInt8](repeating: 0, count: width * height)
+                  guard let context = CGContext(
+                      data: &pixels,
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bytesPerRow: width,
+                      space: CGColorSpaceCreateDeviceGray(),
+                      bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else { return true }
+
+                  context.Draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+                  if lastPixelSignature.count == pixels.count {
+                      var totalDiff = 0
+                      for i in 0..<pixels.count {
+                          totalDiff += abs(Int(pixels[i]) - Int(lastPixelSignature[i]))
+                      }
+                      let avgDiff = Double(totalDiff) / Double(pixels.count)
+                      if avgDiff < 2.2 {
+                          return false
+                      }
+                  }
+                  lastPixelSignature = pixels
+                  return true
               }
 
               private func preprocessImage(_ cgImage: CGImage) -> CGImage {
@@ -651,11 +774,22 @@ jobs:
                   return luminance > 0.62
               }
 
+              // Clean OCR Artifacts (e.g., stray border pipes |, _, ~, broken hyphens)
+              private func cleanOCRText(_ raw: String) -> String {
+                  var cleaned = raw
+                      .replacingOccurrences(of: "|", with: " ")
+                      .replacingOccurrences(of: "—", with: " - ")
+                      .replacingOccurrences(of: "- ", with: "")
+                      .replacingOccurrences(of: "  ", with: " ")
+                  let trimSet = CharacterSet(charactersIn: "_~^`•*«»<>[]{}\\/").union(.whitespacesAndNewlines)
+                  cleaned = cleaned.trimmingCharacters(in: trimSet)
+                  return cleaned
+              }
+
               func captureAndTranslate(force: Bool = false) {
                   guard let webView = webView, !isBusy, !isPrivacyLocked else { return }
                   isBusy = true
 
-                  // Optimized Snapshot Width (1.25x max) for 3x faster capture & OCR
                   let config = WKSnapshotConfiguration()
                   let targetWidth = min(webView.bounds.width * 1.25, 1366)
                   config.snapshotWidth = NSNumber(value: Double(max(targetWidth, 600)))
@@ -680,6 +814,16 @@ jobs:
                           return
                       }
 
+                      // Instant Pixel-Diff Check (Saves 85% CPU & Battery)
+                      if !force && !self.hasImageChanged(croppedCGImage) {
+                          self.unchangedTicks += 1
+                          if self.useEcoTouchMode && self.unchangedTicks >= 12 {
+                              self.isScannerSleeping = true
+                          }
+                          self.isBusy = false
+                          return
+                      }
+
                       let finalImage = self.preprocessImage(croppedCGImage)
                       self.recognizeRegionText(in: finalImage, force: force)
                   }
@@ -687,10 +831,8 @@ jobs:
 
               private func activeRecognitionLanguages() -> [String] {
                   if ocrLanguageMode == 0 {
-                      // Fast Latin/European Mode
                       return ["en-US", "es-ES", "fr-FR", "de-DE"]
                   } else {
-                      // Full Asian + English Mode
                       return ["en-US", "ja-JP", "zh-Hans", "ko-KR"]
                   }
               }
@@ -707,7 +849,7 @@ jobs:
                       var lines: [String] = []
                       for obs in sorted {
                           if let top = obs.topCandidates(1).first {
-                              let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                              let txt = self.cleanOCRText(top.string)
                               if txt.count >= 2 { lines.append(txt) }
                           }
                       }
@@ -723,7 +865,7 @@ jobs:
                           }
                       }
 
-                      let fullDialogue = dialogueLines.joined(separator: " ")
+                      let fullDialogue = self.cleanOCRText(dialogueLines.joined(separator: " "))
                       let normalized = (detectedSpeaker + fullDialogue).lowercased().filter { $0.isLetter || $0.isNumber }
 
                       if normalized.isEmpty {
@@ -740,7 +882,7 @@ jobs:
                       if !force && normalized == self.lastNormalizedText {
                           DispatchQueue.main.async {
                               self.unchangedTicks += 1
-                              if self.useEcoTouchMode && self.unchangedTicks >= 10 {
+                              if self.useEcoTouchMode && self.unchangedTicks >= 12 {
                                   self.isScannerSleeping = true
                               }
                               self.isBusy = false
@@ -786,17 +928,17 @@ jobs:
               }
 
               private func captureFullScreenOnce() {
-                  guard let webView = webView, !isBusy else { return }
-                  isBusy = true
+                  guard let webView = webView, !isFullScreenBusy else { return }
+                  isFullScreenBusy = true
                   screenBoxes.removeAll()
 
                   let config = WKSnapshotConfiguration()
-                  let targetWidth = min(webView.bounds.width * 1.5, 1600)
+                  let targetWidth = min(webView.bounds.width * 1.4, 1500)
                   config.snapshotWidth = NSNumber(value: Double(max(targetWidth, 800)))
 
                   webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
-                          self?.isBusy = false
+                          self?.isFullScreenBusy = false
                           return
                       }
 
@@ -806,14 +948,14 @@ jobs:
                       let request = VNRecognizeTextRequest { [weak self] req, _ in
                           guard let self = self,
                                 let results = req.results as? [VNRecognizedTextObservation] else {
-                              DispatchQueue.main.async { self?.isBusy = false }
+                              DispatchQueue.main.async { self?.isFullScreenBusy = false }
                               return
                           }
 
                           var temp: [ScreenBox] = []
                           for obs in results {
                               guard let top = obs.topCandidates(1).first else { continue }
-                              let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                              let txt = self.cleanOCRText(top.string)
                               if txt.count < 2 { continue }
                               let b = obs.boundingBox
                               let rect = CGRect(x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, width: b.size.width, height: b.size.height)
@@ -844,7 +986,7 @@ jobs:
                                   }
                               }
                               group.notify(queue: .main) {
-                                  self.isBusy = false
+                                  self.isFullScreenBusy = false
                               }
                           }
                       }
@@ -933,14 +1075,12 @@ jobs:
                   }.resume()
               }
 
-              // Strict URL Encoding (Fixes ?, &, +, = breaking Arabic translation)
               private func strictURLEncode(_ text: String) -> String? {
                   var allowed = CharacterSet.urlQueryAllowed
                   allowed.remove(charactersIn: "!*'();:@&=+$,/?%#[]")
                   return text.addingPercentEncoding(withAllowedCharacters: allowed)
               }
 
-              // Dual-Engine Fast Arabic Translator (GTX + Clients5 Fallback)
               private func translateGoogleGTX(_ text: String, completion: @escaping (String) -> Void) {
                   guard let enc = strictURLEncode(text),
                         let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&dj=1&q=\(enc)") else {
@@ -954,7 +1094,6 @@ jobs:
 
                   URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
                       if let data = data {
-                          // Parse dj=1 JSON format first
                           if let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                              let sentences = dict["sentences"] as? [[String: Any]] {
                               let combined = sentences.compactMap { $0["trans"] as? String }.joined()
@@ -963,7 +1102,6 @@ jobs:
                                   return
                               }
                           }
-                          // Parse classic nested array format
                           if let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
                              let arr = json.first as? [[Any]] {
                               let combined = arr.compactMap { $0.first as? String }.joined()
@@ -973,7 +1111,6 @@ jobs:
                               }
                           }
                       }
-                      // Fallback to Secondary Google Mirror if Primary fails
                       self?.translateGoogleFallback(text, encoded: enc, completion: completion)
                   }.resume()
               }
@@ -1003,7 +1140,7 @@ jobs:
               }
           }
 
-          // MARK: - WebView Wrapper
+          // MARK: - WebView Wrapper with Fullscreen Interceptor & Audio Keep-Alive
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
               var onTwoFingerTap: () -> Void
@@ -1022,25 +1159,97 @@ jobs:
                   config.defaultWebpagePreferences = prefs
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
+                  // Disable native system fullscreen takeover so SwiftUI overlays NEVER disappear!
                   if #available(iOS 15.4, *) {
-                      config.preferences.isElementFullscreenEnabled = true
+                      config.preferences.isElementFullscreenEnabled = false
                   }
 
+                  // Master Script: Fake Fullscreen Interceptor + WebAudio KeepAlive + AdBlock + Touch Hook
                   let masterScript = WKUserScript(
                       source: """
                       (function() {
                           window.open = function() { return null; };
 
+                          // 1. CSS for Fake Fullscreen, HD Enhancer & AdBlock
                           var style = document.createElement('style');
                           style.id = 'ultra-hd-enhancer';
                           style.innerHTML = `
                               canvas, img, video { image-rendering: -webkit-optimize-contrast !important; filter: contrast(1.06) saturate(1.10) brightness(1.02) !important; }
                               body, * { -webkit-font-smoothing: antialiased !important; }
                               iframe[src*="ads"], iframe[src*="doubleclick"], .ad-banner, .adsbox, [id^="google_ads"] { display: none !important; }
+                              .ultra-fake-fullscreen {
+                                  position: fixed !important;
+                                  top: 0 !important;
+                                  left: 0 !important;
+                                  width: 100vw !important;
+                                  height: 100vh !important;
+                                  max-width: 100vw !important;
+                                  max-height: 100vh !important;
+                                  z-index: 2147483647 !important;
+                                  background: #000 !important;
+                                  margin: 0 !important;
+                                  padding: 0 !important;
+                                  border: none !important;
+                              }
                           `;
                           document.documentElement.appendChild(style);
 
+                          // 2. Intercept HTML5 Fullscreen API so game stays inside WebView under SwiftUI overlays
+                          var fakeFullscreenElement = null;
+                          var enterFakeFS = function() {
+                              var el = (this === window || this === document) ? document.documentElement : this;
+                              el.classList.add('ultra-fake-fullscreen');
+                              fakeFullscreenElement = el;
+                              document.dispatchEvent(new Event('fullscreenchange'));
+                              document.dispatchEvent(new Event('webkitfullscreenchange'));
+                              window.dispatchEvent(new Event('resize'));
+                              return Promise.resolve();
+                          };
+                          var exitFakeFS = function() {
+                              document.querySelectorAll('.ultra-fake-fullscreen').forEach(function(e) {
+                                  e.classList.remove('ultra-fake-fullscreen');
+                              });
+                              fakeFullscreenElement = null;
+                              document.dispatchEvent(new Event('fullscreenchange'));
+                              document.dispatchEvent(new Event('webkitfullscreenchange'));
+                              window.dispatchEvent(new Event('resize'));
+                              return Promise.resolve();
+                          };
+
+                          Element.prototype.requestFullscreen = enterFakeFS;
+                          Element.prototype.webkitRequestFullscreen = enterFakeFS;
+                          Element.prototype.webkitRequestFullScreen = enterFakeFS;
+                          Element.prototype.webkitEnterFullscreen = enterFakeFS;
+                          Document.prototype.exitFullscreen = exitFakeFS;
+                          Document.prototype.webkitExitFullscreen = exitFakeFS;
+                          Document.prototype.webkitCancelFullScreen = exitFakeFS;
+
+                          try {
+                              Object.defineProperty(document, 'fullscreenElement', { get: function() { return fakeFullscreenElement; } });
+                              Object.defineProperty(document, 'webkitFullscreenElement', { get: function() { return fakeFullscreenElement; } });
+                              Object.defineProperty(document, 'fullscreenEnabled', { get: function() { return true; } });
+                              Object.defineProperty(document, 'webkitFullscreenEnabled', { get: function() { return true; } });
+                          } catch(e) {}
+
+                          // 3. WebAudio Auto-Resume (Fixes iOS Safari/WebGL sound muting)
+                          var activeContexts = [];
+                          var OrigAudioCtx = window.AudioContext || window.webkitAudioContext;
+                          if (OrigAudioCtx) {
+                              var PatchedAudioCtx = function() {
+                                  var ctx = new OrigAudioCtx();
+                                  activeContexts.push(ctx);
+                                  return ctx;
+                              };
+                              PatchedAudioCtx.prototype = OrigAudioCtx.prototype;
+                              window.AudioContext = PatchedAudioCtx;
+                              window.webkitAudioContext = PatchedAudioCtx;
+                          }
+
+                          // 4. Notify Swift on Touch/Key & Resume Audio
                           var notifyTouch = function() {
+                              activeContexts.forEach(function(ctx) {
+                                  if (ctx && ctx.state === 'suspended') { ctx.resume(); }
+                              });
                               if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.gameHook) {
                                   window.webkit.messageHandlers.gameHook.postMessage('touch');
                               }
@@ -1050,7 +1259,7 @@ jobs:
                           window.addEventListener('keydown', notifyTouch, { passive: true });
                       })();
                       """,
-                      injectionTime: .atDocumentEnd,
+                      injectionTime: .atDocumentStart,
                       forMainFrameOnly: false
                   )
                   config.userContentController.addUserScript(masterScript)
@@ -1215,14 +1424,28 @@ jobs:
               }
           }
 
+          // Draggable Virtual Gamepad
           struct VirtualHotkeysOverlay: View {
               @ObservedObject var vm: BrowserViewModel
+              let screenSize: CGSize
+              @State private var padPos: CGPoint = CGPoint(x: 220, y: 110)
+              @State private var padDragStart: CGPoint? = nil
 
               var body: some View {
                   VStack(spacing: 8) {
-                      HStack(spacing: 8) {
+                      HStack {
+                          Image(systemName: "hand.draw.fill").font(.system(size: 11)).foregroundColor(.cyan)
+                          Text("اسحب لتحريك يد التحكم 🎮").font(.system(size: 11, weight: .bold)).foregroundColor(.cyan)
+                          Spacer()
+                          Button(action: { withAnimation { vm.showVirtualKeys = false } }) {
+                              Image(systemName: "xmark.circle.fill").foregroundColor(.white.opacity(0.7))
+                          }
+                      }
+                      .padding(.horizontal, 4)
+
+                      HStack(spacing: 7) {
                           Button(action: { vm.sendPCKey(key: " ", code: "Space", keyCode: 32) }) {
-                              Text("Space (التالي)")
+                              Text("Space")
                                   .font(.system(size: 12, weight: .bold))
                                   .padding(.horizontal, 10).padding(.vertical, 7)
                                   .background(Color.blue.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
@@ -1240,56 +1463,68 @@ jobs:
                                   .background(Color.indigo.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Control", code: "ControlLeft", keyCode: 17) }) {
-                              Text("Ctrl (تخطي)")
+                              Text("Ctrl")
                                   .font(.system(size: 12, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .padding(.horizontal, 9).padding(.vertical, 7)
                                   .background(Color.purple.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Escape", code: "Escape", keyCode: 27) }) {
                               Text("Esc")
                                   .font(.system(size: 12, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .padding(.horizontal, 9).padding(.vertical, 7)
                                   .background(Color.red.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Enter", code: "Enter", keyCode: 13) }) {
                               Text("Enter")
                                   .font(.system(size: 12, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .padding(.horizontal, 9).padding(.vertical, 7)
                                   .background(Color.green.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                       }
 
-                      // RPG Maker Arrow Keys Row
-                      HStack(spacing: 12) {
+                      HStack(spacing: 10) {
                           Button(action: { vm.sendPCKey(key: "ArrowLeft", code: "ArrowLeft", keyCode: 37) }) {
                               Image(systemName: "arrow.left").font(.system(size: 14, weight: .bold))
-                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                                  .frame(width: 38, height: 32).background(Color.white.opacity(0.22)).foregroundColor(.white).cornerRadius(7)
                           }
                           Button(action: { vm.sendPCKey(key: "ArrowUp", code: "ArrowUp", keyCode: 38) }) {
                               Image(systemName: "arrow.up").font(.system(size: 14, weight: .bold))
-                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                                  .frame(width: 38, height: 32).background(Color.white.opacity(0.22)).foregroundColor(.white).cornerRadius(7)
                           }
                           Button(action: { vm.sendPCKey(key: "ArrowDown", code: "ArrowDown", keyCode: 40) }) {
                               Image(systemName: "arrow.down").font(.system(size: 14, weight: .bold))
-                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                                  .frame(width: 38, height: 32).background(Color.white.opacity(0.22)).foregroundColor(.white).cornerRadius(7)
                           }
                           Button(action: { vm.sendPCKey(key: "ArrowRight", code: "ArrowRight", keyCode: 39) }) {
                               Image(systemName: "arrow.right").font(.system(size: 14, weight: .bold))
-                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                                  .frame(width: 38, height: 32).background(Color.white.opacity(0.22)).foregroundColor(.white).cornerRadius(7)
                           }
                           Button(action: { vm.sendPCKey(key: "h", code: "KeyH", keyCode: 72) }) {
-                              Text("H (إخفاء نص اللعبة)")
+                              Text("H (إخفاء)")
                                   .font(.system(size: 11, weight: .bold))
-                                  .padding(.horizontal, 8).frame(height: 30)
+                                  .padding(.horizontal, 8).frame(height: 32)
                                   .background(Color.orange.opacity(0.85)).foregroundColor(.white).cornerRadius(7)
                           }
                       }
                   }
                   .padding(10)
+                  .frame(width: 340)
                   .background(.ultraThinMaterial)
-                  .cornerRadius(14)
-                  .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.25), lineWidth: 1))
-                  .shadow(radius: 6)
+                  .cornerRadius(16)
+                  .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.28), lineWidth: 1))
+                  .shadow(color: .black.opacity(0.5), radius: 8)
+                  .position(padPos)
+                  .gesture(
+                      DragGesture()
+                          .onChanged { value in
+                              if padDragStart == nil { padDragStart = padPos }
+                              guard let start = padDragStart else { return }
+                              let nx = min(max(175, start.x + value.translation.width), screenSize.width - 175)
+                              let ny = min(max(65, start.y + value.translation.height), screenSize.height - 65)
+                              padPos = CGPoint(x: nx, y: ny)
+                          }
+                          .onEnded { _ in padDragStart = nil }
+                  )
               }
           }
 
@@ -1297,7 +1532,9 @@ jobs:
           struct ContentView: View {
               @StateObject private var vm = BrowserViewModel()
               @State private var showBar = false
-              @State private var hideControls = false
+              @State private var isOrbCollapsed = false
+              @State private var showControlHub = false
+
               @State private var showBookmarksSheet = false
               @State private var showHistorySheet = false
               @State private var showSaveStatesSheet = false
@@ -1312,8 +1549,9 @@ jobs:
               @State private var resizeStartRegion: CGRect? = nil
               @State private var subDragStart: CGPoint? = nil
 
-              @State private var ballPos: CGPoint = CGPoint(x: 65, y: 140)
-              @State private var ballDragStart: CGPoint? = nil
+              @State private var floatingPos: CGPoint = CGPoint(x: 190, y: 60)
+              @State private var floatingDragStart: CGPoint? = nil
+              @State private var didSetInitialFloatingPos = false
 
               var body: some View {
                   ZStack {
@@ -1343,8 +1581,8 @@ jobs:
                                       .foregroundColor(.white)
                                       .cornerRadius(10)
 
-                                  Button(action: { showBookmarksSheet = true }) {
-                                      Image(systemName: "star.fill").font(.system(size: 18)).foregroundColor(.yellow).padding(8)
+                                  Button(action: { withAnimation { showBar = false } }) {
+                                      Image(systemName: "xmark.circle.fill").font(.system(size: 20)).foregroundColor(.white.opacity(0.8)).padding(6)
                                   }
                               }
                               .padding(.horizontal, 18)
@@ -1365,16 +1603,22 @@ jobs:
                                   WebViewWrapper(
                                       vm: vm,
                                       onTwoFingerTap: { withAnimation { vm.hideSubtitlesTemp.toggle() } },
-                                      onThreeFingerTap: { withAnimation(.spring()) { hideControls.toggle() } }
+                                      onThreeFingerTap: { withAnimation(.spring()) { isOrbCollapsed.toggle() } }
                                   )
                                   .frame(width: geo.size.width, height: geo.size.height)
+                                  .onAppear {
+                                      if !didSetInitialFloatingPos {
+                                          didSetInitialFloatingPos = true
+                                          floatingPos = CGPoint(x: geo.size.width / 2, y: geo.size.height - 38)
+                                      }
+                                  }
 
                                   // 1. Cinema Region Subtitle Overlay
                                   if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion && !vm.hideSubtitlesTemp {
                                       SubtitleOverlayView(vm: vm, boxW: boxW, screenW: geo.size.width, subX: subX, subY: subY)
                                   }
 
-                                  // 2. Smart Full-Screen Manga Bubbles Overlay
+                                  // 2. Smart Full-Screen / Choices Overlay (Works Simultaneously!)
                                   if vm.isFullScreenTranslated && !vm.hideSubtitlesTemp {
                                       ForEach(vm.screenBoxes) { box in
                                           Text(box.translatedText)
@@ -1403,13 +1647,9 @@ jobs:
                                       }
                                   }
 
-                                  // 3. Virtual PC Hotkeys Floating Bar
+                                  // 3. Draggable Virtual PC Gamepad
                                   if vm.showVirtualKeys {
-                                      VStack {
-                                          VirtualHotkeysOverlay(vm: vm)
-                                              .padding(.top, 14)
-                                          Spacer()
-                                      }
+                                      VirtualHotkeysOverlay(vm: vm, screenSize: geo.size)
                                   }
 
                                   // 4. Region & Subtitle Target Editors
@@ -1497,288 +1737,264 @@ jobs:
                                       )
                                   }
 
-                                  // 5. Draggable Assistive Ball when Controls are Hidden
-                                  if hideControls {
-                                      Button(action: { withAnimation(.spring()) { hideControls = false } }) {
-                                          ZStack {
-                                              Circle()
-                                                  .fill(.ultraThinMaterial)
-                                                  .frame(width: 48, height: 48)
-                                                  .overlay(
-                                                      Circle().stroke(vm.isAutoTranslating ? Color.cyan : Color.white.opacity(0.4), lineWidth: 2)
-                                                  )
-                                                  .shadow(color: .black.opacity(0.5), radius: 6)
+                                  // 5. Status Toast Notification (Top)
+                                  if !vm.statusToast.isEmpty {
+                                      VStack {
+                                          Text(vm.statusToast)
+                                              .font(.system(size: 14, weight: .bold, design: .rounded))
+                                              .foregroundColor(.white)
+                                              .padding(.horizontal, 16)
+                                              .padding(.vertical, 8)
+                                              .background(Color.black.opacity(0.85))
+                                              .clipShape(Capsule())
+                                              .overlay(Capsule().stroke(Color.cyan.opacity(0.5), lineWidth: 1))
+                                              .padding(.top, 14)
+                                          Spacer()
+                                      }
+                                      .allowsHitTesting(false)
+                                  }
 
-                                              Image(systemName: "eye.slash.fill")
-                                                  .font(.system(size: 18, weight: .bold))
-                                                  .foregroundColor(.white)
+                                  // 6. Control Hub Grid Modal (Opens when tapping ⊞)
+                                  if showControlHub && !vm.isPrivacyLocked {
+                                      ZStack {
+                                          Color.black.opacity(0.45)
+                                              .ignoresSafeArea()
+                                              .onTapGesture { withAnimation(.spring()) { showControlHub = false } }
+
+                                          VStack(spacing: 14) {
+                                              HStack {
+                                                  Text("مركز أدوات المترجم ⚡")
+                                                      .font(.system(size: 16, weight: .heavy, design: .rounded))
+                                                      .foregroundColor(.white)
+                                                  Spacer()
+                                                  Button(action: { withAnimation(.spring()) { showControlHub = false } }) {
+                                                      Image(systemName: "xmark.circle.fill")
+                                                          .font(.system(size: 22))
+                                                          .foregroundColor(.white.opacity(0.75))
+                                                  }
+                                              }
+                                              .padding(.horizontal, 6)
+
+                                              let cols = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
+                                              LazyVGrid(columns: cols, spacing: 10) {
+                                                  // 1. URL Bar
+                                                  HubTileButton(icon: "safari.fill", title: "الرابط", color: showBar ? .cyan : .white, isActive: showBar) {
+                                                      withAnimation { showBar.toggle(); showControlHub = false }
+                                                  }
+                                                  // 2. Color Cycle
+                                                  HubTileButton(icon: "paintpalette.fill", title: "لون الخط", color: vm.activeSubtitleColor, isActive: true) {
+                                                      vm.cycleSubtitleColor()
+                                                  }
+                                                  // 3. Gamepad
+                                                  HubTileButton(icon: "gamecontroller.fill", title: "يد تحكم", color: vm.showVirtualKeys ? .orange : .white, isActive: vm.showVirtualKeys) {
+                                                      withAnimation { vm.showVirtualKeys.toggle(); showControlHub = false }
+                                                  }
+                                                  // 4. Speedhack
+                                                  HubTileButton(icon: "bolt.fill", title: "السرعة \(String(format: "%g", vm.gameSpeed))x", color: vm.gameSpeed > 1.0 ? .orange : .white, isActive: vm.gameSpeed > 1.0) {
+                                                      vm.cycleGameSpeed()
+                                                  }
+                                                  // 5. Voice TTS
+                                                  HubTileButton(icon: vm.ttsMode == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill", title: vm.ttsMode == 0 ? "النطق: مغلق" : (vm.ttsMode == 1 ? "نطق EN" : "نطق عربي"), color: vm.ttsMode > 0 ? .green : .white, isActive: vm.ttsMode > 0) {
+                                                      vm.cycleTTSMode()
+                                                  }
+                                                  // 6. Dual Subtitles
+                                                  HubTileButton(icon: "character.book.closed.fill", title: "قاموس A/ع", color: vm.showDualSubtitles ? .cyan : .white, isActive: vm.showDualSubtitles) {
+                                                      vm.showDualSubtitles.toggle()
+                                                  }
+                                                  // 7. Save States
+                                                  HubTileButton(icon: "externaldrive.fill.badge.checkmark", title: "التختيمات", color: .green, isActive: false) {
+                                                      showControlHub = false; showSaveStatesSheet = true
+                                                  }
+                                                  // 8. History
+                                                  HubTileButton(icon: "clock.arrow.circlepath", title: "السجل", color: .cyan, isActive: false) {
+                                                      showControlHub = false; showHistorySheet = true
+                                                  }
+                                                  // 9. Bookmarks
+                                                  HubTileButton(icon: "star.fill", title: "المفضلة", color: .yellow, isActive: false) {
+                                                      showControlHub = false; showBookmarksSheet = true
+                                                  }
+                                                  // 10. Auto Scroll
+                                                  HubTileButton(icon: vm.isAutoScrolling ? "pause.circle.fill" : "arrow.down.circle.fill", title: "تمرير مانجا", color: vm.isAutoScrolling ? .green : .white, isActive: vm.isAutoScrolling) {
+                                                      vm.toggleAutoScroll(); showControlHub = false
+                                                  }
+                                                  // 11. HD Filter
+                                                  HubTileButton(icon: "sparkles", title: "وضوح HD", color: vm.isHDEnhanced ? .yellow : .white, isActive: vm.isHDEnhanced) {
+                                                      vm.toggleHDEnhancer()
+                                                  }
+                                                  // 12. Settings
+                                                  HubTileButton(icon: "gearshape.fill", title: "الإعدادات", color: vm.useGeminiAI ? .green : .white, isActive: vm.useGeminiAI) {
+                                                      showControlHub = false; showSettingsSheet = true
+                                                  }
+                                              }
+
+                                              HStack(spacing: 10) {
+                                                  Button(action: { vm.webView?.goBack(); showControlHub = false }) {
+                                                      HStack(spacing: 4) {
+                                                          Image(systemName: "arrow.uturn.backward")
+                                                          Text("رجوع بالمتصفح")
+                                                      }
+                                                      .font(.system(size: 13, weight: .bold))
+                                                      .foregroundColor(.white)
+                                                      .frame(maxWidth: .infinity)
+                                                      .padding(.vertical, 10)
+                                                      .background(Color.white.opacity(0.15))
+                                                      .cornerRadius(10)
+                                                  }
+
+                                                  Button(action: { showControlHub = false; withAnimation { vm.togglePrivacyLock() } }) {
+                                                      HStack(spacing: 4) {
+                                                          Image(systemName: "lock.shield.fill")
+                                                          Text("درع الخصوصية الفوري")
+                                                      }
+                                                      .font(.system(size: 13, weight: .bold))
+                                                      .foregroundColor(.white)
+                                                      .frame(maxWidth: .infinity)
+                                                      .padding(.vertical, 10)
+                                                      .background(Color.red.opacity(0.75))
+                                                      .cornerRadius(10)
+                                                  }
+                                              }
+                                          }
+                                          .padding(16)
+                                          .frame(width: min(geo.size.width - 32, 390))
+                                          .background(.ultraThinMaterial)
+                                          .cornerRadius(24)
+                                          .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                          .shadow(color: .black.opacity(0.6), radius: 20)
+                                      }
+                                  }
+
+                                  // 7. Compact Floating Orb / Mini-Capsule (Replaces Giant Bottom Bar!)
+                                  if !vm.isPrivacyLocked {
+                                      Group {
+                                          if isOrbCollapsed {
+                                              // Mode A: Tiny Draggable Assistive Orb
+                                              Button(action: { withAnimation(.spring()) { isOrbCollapsed = false } }) {
+                                                  ZStack {
+                                                      Circle()
+                                                          .fill(Color.black.opacity(0.72))
+                                                          .frame(width: 46, height: 46)
+                                                          .overlay(
+                                                              Circle().stroke(
+                                                                  vm.isAutoTranslating ? Color.cyan : Color.white.opacity(0.35),
+                                                                  lineWidth: vm.isAutoTranslating ? 2.5 : 1.5
+                                                              )
+                                                          )
+                                                          .shadow(color: .black.opacity(0.5), radius: 6)
+
+                                                      VStack(spacing: 1) {
+                                                          Image(systemName: vm.isAutoTranslating ? "waveform" : "globe")
+                                                              .font(.system(size: 15, weight: .bold))
+                                                              .foregroundColor(vm.isAutoTranslating ? .cyan : .white)
+                                                          Text("ع")
+                                                              .font(.system(size: 10, weight: .heavy))
+                                                              .foregroundColor(vm.activeSubtitleColor)
+                                                      }
+                                                  }
+                                              }
+                                          } else {
+                                              // Mode B: Compact Favorite Actions Capsule (Only 5 Core Icons + Collapse)
+                                              HStack(spacing: 8) {
+                                                  // 1. Play / Pause Auto-Translate
+                                                  Button(action: { vm.toggleAutoTranslate() }) {
+                                                      HStack(spacing: 5) {
+                                                          Image(systemName: vm.isAutoTranslating ? "pause.fill" : "play.fill")
+                                                          Text(vm.isAutoTranslating ? "تلقائي" : "ترجم")
+                                                      }
+                                                      .font(.system(size: 13, weight: .bold, design: .rounded))
+                                                      .foregroundColor(.white)
+                                                      .padding(.horizontal, 12)
+                                                      .frame(height: 36)
+                                                      .background(
+                                                          LinearGradient(
+                                                              colors: vm.isAutoTranslating ? [.red, .pink] : [.blue, .cyan],
+                                                              startPoint: .leading,
+                                                              endPoint: .trailing
+                                                          )
+                                                      )
+                                                      .clipShape(Capsule())
+                                                  }
+
+                                                  // 2. Region Selector
+                                                  Button(action: {
+                                                      withAnimation(.spring()) {
+                                                          vm.isEditingRegion.toggle()
+                                                          if vm.isEditingRegion { vm.isAutoTranslating = false }
+                                                      }
+                                                  }) {
+                                                      Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
+                                                          .font(.system(size: 15, weight: .bold))
+                                                          .foregroundColor(.white)
+                                                          .frame(width: 36, height: 36)
+                                                          .background(vm.isEditingRegion ? Color.green : Color.orange.opacity(0.85))
+                                                          .clipShape(Circle())
+                                                  }
+
+                                                  // 3. Instant Screen / Choices Translate
+                                                  Button(action: { vm.toggleFullScreenTranslate() }) {
+                                                      Image(systemName: vm.isFullScreenTranslated ? "xmark.viewfinder" : "doc.text.viewfinder")
+                                                          .font(.system(size: 15, weight: .bold))
+                                                          .foregroundColor(.white)
+                                                          .frame(width: 36, height: 36)
+                                                          .background(vm.isFullScreenTranslated ? Color.purple : Color.indigo.opacity(0.85))
+                                                          .clipShape(Circle())
+                                                  }
+
+                                                  // 4. Smart Game Fullscreen Zoom (Fixes Fullscreen Issue!)
+                                                  Button(action: { vm.toggleGameTheaterZoom() }) {
+                                                      Image(systemName: vm.isGameTheaterZoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                                                          .font(.system(size: 14, weight: .bold))
+                                                          .foregroundColor(vm.isGameTheaterZoomed ? .black : .white)
+                                                          .frame(width: 36, height: 36)
+                                                          .background(vm.isGameTheaterZoomed ? Color.cyan : Color.white.opacity(0.18))
+                                                          .clipShape(Circle())
+                                                  }
+
+                                                  // 5. Open Control Center Grid Hub (⊞)
+                                                  Button(action: { withAnimation(.spring()) { showControlHub.toggle() } }) {
+                                                      Image(systemName: "square.grid.2x2.fill")
+                                                          .font(.system(size: 15, weight: .bold))
+                                                          .foregroundColor(showControlHub ? .cyan : .white)
+                                                          .frame(width: 36, height: 36)
+                                                          .background(Color.white.opacity(0.18))
+                                                          .clipShape(Circle())
+                                                  }
+
+                                                  // 6. Collapse to Tiny Circle
+                                                  Button(action: { withAnimation(.spring()) { isOrbCollapsed = true; showControlHub = false } }) {
+                                                      Image(systemName: "chevron.down.circle.fill")
+                                                          .font(.system(size: 16, weight: .bold))
+                                                          .foregroundColor(.white.opacity(0.75))
+                                                          .frame(width: 32, height: 36)
+                                                  }
+                                              }
+                                              .padding(.horizontal, 10)
+                                              .padding(.vertical, 6)
+                                              .background(.ultraThinMaterial)
+                                              .clipShape(Capsule())
+                                              .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                              .shadow(color: .black.opacity(0.5), radius: 8, x: 0, y: 4)
                                           }
                                       }
-                                      .position(ballPos)
+                                      .position(floatingPos)
                                       .highPriorityGesture(
                                           DragGesture()
                                               .onChanged { value in
-                                                  if ballDragStart == nil { ballDragStart = ballPos }
-                                                  guard let start = ballDragStart else { return }
-                                                  let nx = min(max(30, start.x + value.translation.width), geo.size.width - 30)
+                                                  if floatingDragStart == nil { floatingDragStart = floatingPos }
+                                                  guard let start = floatingDragStart else { return }
+                                                  let margin: CGFloat = isOrbCollapsed ? 28 : 130
+                                                  let nx = min(max(margin, start.x + value.translation.width), geo.size.width - margin)
                                                   let ny = min(max(30, start.y + value.translation.height), geo.size.height - 30)
-                                                  ballPos = CGPoint(x: nx, y: ny)
+                                                  floatingPos = CGPoint(x: nx, y: ny)
                                               }
-                                              .onEnded { _ in ballDragStart = nil }
+                                              .onEnded { _ in floatingDragStart = nil }
                                       )
                                   }
                               }
                           }
                       }
 
-                      // 6. Sleek Glassmorphic Floating Control Dock
-                      if !hideControls && !vm.isPrivacyLocked {
-                          VStack {
-                              Spacer()
-                              ScrollView(.horizontal, showsIndicators: false) {
-                                  HStack(spacing: 8) {
-                                      // Back Button
-                                      Button(action: { vm.webView?.goBack() }) {
-                                          Image(systemName: "arrow.uturn.backward")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // URL Bar Toggle
-                                      Button(action: { withAnimation(.spring()) { showBar.toggle() } }) {
-                                          Image(systemName: showBar ? "safari.fill" : "safari")
-                                              .font(.system(size: 16, weight: .bold))
-                                              .foregroundColor(showBar ? .cyan : .white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Bookmarks
-                                      Button(action: { showBookmarksSheet = true }) {
-                                          Image(systemName: "star.fill")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.yellow)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Save-State Backup Vault
-                                      Button(action: { showSaveStatesSheet = true }) {
-                                          Image(systemName: "externaldrive.fill.badge.checkmark")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.green)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // History Log
-                                      Button(action: { showHistorySheet = true }) {
-                                          Image(systemName: "clock.arrow.circlepath")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.cyan)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Quick Subtitle Color Switcher Button 🎨
-                                      Button(action: { vm.cycleSubtitleColor() }) {
-                                          ZStack {
-                                              Circle()
-                                                  .fill(Color.white.opacity(0.15))
-                                                  .frame(width: 38, height: 38)
-                                              Image(systemName: "paintpalette.fill")
-                                                  .font(.system(size: 15, weight: .bold))
-                                                  .foregroundColor(vm.activeSubtitleColor)
-                                          }
-                                      }
-
-                                      // Virtual PC Hotkeys Toggle
-                                      Button(action: { withAnimation { vm.showVirtualKeys.toggle() } }) {
-                                          Image(systemName: "gamecontroller.fill")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(vm.showVirtualKeys ? .orange : .white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Voice-Over TTS Cycle (Off -> EN -> AR)
-                                      Button(action: { vm.cycleTTSMode() }) {
-                                          HStack(spacing: 3) {
-                                              Image(systemName: vm.ttsMode == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                                              if vm.ttsMode > 0 {
-                                                  Text(vm.ttsMode == 1 ? "EN" : "ع")
-                                                      .font(.system(size: 11, weight: .heavy))
-                                              }
-                                          }
-                                          .font(.system(size: 14, weight: .bold))
-                                          .foregroundColor(vm.ttsMode > 0 ? .black : .white)
-                                          .padding(.horizontal, 10)
-                                          .frame(height: 38)
-                                          .background(vm.ttsMode > 0 ? Color.green : Color.white.opacity(0.15))
-                                          .clipShape(Capsule())
-                                      }
-
-                                      // Game Speedhack (1x / 1.5x / 2x)
-                                      Button(action: { vm.cycleGameSpeed() }) {
-                                          Text("\(String(format: "%g", vm.gameSpeed))x⚡")
-                                              .font(.system(size: 13, weight: .heavy, design: .rounded))
-                                              .foregroundColor(vm.gameSpeed > 1.0 ? .black : .white)
-                                              .padding(.horizontal, 10)
-                                              .frame(height: 38)
-                                              .background(vm.gameSpeed > 1.0 ? Color.orange : Color.white.opacity(0.15))
-                                              .clipShape(Capsule())
-                                      }
-
-                                      // Manga Auto-Scroll
-                                      Button(action: { vm.toggleAutoScroll() }) {
-                                          Image(systemName: vm.isAutoScrolling ? "pause.circle.fill" : "arrow.down.circle")
-                                              .font(.system(size: 16, weight: .bold))
-                                              .foregroundColor(vm.isAutoScrolling ? .green : .white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Dual Subtitle + Tap-to-Define Toggle
-                                      Button(action: { vm.showDualSubtitles.toggle() }) {
-                                          Text("A/ع")
-                                              .font(.system(size: 13, weight: .heavy, design: .rounded))
-                                              .foregroundColor(vm.showDualSubtitles ? .black : .white)
-                                              .padding(.horizontal, 10)
-                                              .frame(height: 38)
-                                              .background(vm.showDualSubtitles ? Color.cyan : Color.white.opacity(0.15))
-                                              .clipShape(Capsule())
-                                      }
-
-                                      // HD Graphics Enhancer
-                                      Button(action: { vm.toggleHDEnhancer() }) {
-                                          HStack(spacing: 4) {
-                                              Image(systemName: "sparkles")
-                                              Text("HD")
-                                          }
-                                          .font(.system(size: 13, weight: .heavy, design: .rounded))
-                                          .foregroundColor(vm.isHDEnhanced ? .black : .white)
-                                          .padding(.horizontal, 10)
-                                          .frame(height: 38)
-                                          .background(vm.isHDEnhanced ? Color.yellow : Color.white.opacity(0.15))
-                                          .clipShape(Capsule())
-                                      }
-
-                                      // Settings & Glossary & Colors
-                                      Button(action: { showSettingsSheet = true }) {
-                                          Image(systemName: vm.useGeminiAI ? "brain.head.profile" : "gearshape.fill")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(vm.useGeminiAI ? .green : .white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.15))
-                                              .clipShape(Circle())
-                                      }
-
-                                      Divider().frame(height: 24).background(Color.white.opacity(0.3))
-
-                                      // Region Selector
-                                      Button(action: {
-                                          withAnimation(.spring()) {
-                                              vm.isEditingRegion.toggle()
-                                              if vm.isEditingRegion {
-                                                  vm.isAutoTranslating = false
-                                                  vm.isFullScreenTranslated = false
-                                              }
-                                          }
-                                      }) {
-                                          HStack(spacing: 6) {
-                                              Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
-                                              Text(vm.isEditingRegion ? "تثبيت" : "المنطقة")
-                                          }
-                                          .font(.system(size: 14, weight: .bold, design: .rounded))
-                                          .foregroundColor(.white)
-                                          .padding(.horizontal, 12)
-                                          .frame(height: 38)
-                                          .background(vm.isEditingRegion ? Color.green : Color.orange.opacity(0.9))
-                                          .clipShape(Capsule())
-                                      }
-
-                                      // Auto Region Translate
-                                      Button(action: { vm.toggleAutoTranslate() }) {
-                                          HStack(spacing: 6) {
-                                              Image(systemName: vm.isAutoTranslating ? "pause.fill" : "play.fill")
-                                              Text(vm.isAutoTranslating ? "إيقاف التلقائي" : "ترجمة تلقائية")
-                                          }
-                                          .font(.system(size: 14, weight: .bold, design: .rounded))
-                                          .foregroundColor(.white)
-                                          .padding(.horizontal, 14)
-                                          .frame(height: 38)
-                                          .background(
-                                              LinearGradient(
-                                                  colors: vm.isAutoTranslating ? [.red, .pink] : [.blue, .cyan],
-                                                  startPoint: .leading,
-                                                  endPoint: .trailing
-                                              )
-                                          )
-                                          .clipShape(Capsule())
-                                      }
-
-                                      // Full Screen Manga Translate
-                                      Button(action: { vm.toggleFullScreenTranslate() }) {
-                                          HStack(spacing: 6) {
-                                              Image(systemName: vm.isFullScreenTranslated ? "xmark.circle.fill" : "doc.text.viewfinder")
-                                              Text(vm.isFullScreenTranslated ? "إخفاء الشاشة" : "ترجمة الشاشة")
-                                          }
-                                          .font(.system(size: 14, weight: .bold, design: .rounded))
-                                          .foregroundColor(.white)
-                                          .padding(.horizontal, 14)
-                                          .frame(height: 38)
-                                          .background(
-                                              LinearGradient(
-                                                  colors: vm.isFullScreenTranslated ? [.purple, .pink] : [.indigo, .purple],
-                                                  startPoint: .leading,
-                                                  endPoint: .trailing
-                                              )
-                                          )
-                                          .clipShape(Capsule())
-                                      }
-
-                                      // Boss / Privacy Lock Button
-                                      Button(action: { withAnimation { vm.togglePrivacyLock() } }) {
-                                          Image(systemName: "lock.shield.fill")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.red)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.18))
-                                              .clipShape(Circle())
-                                      }
-
-                                      // Hide Controls to Draggable Ball
-                                      Button(action: { withAnimation(.spring()) { hideControls = true } }) {
-                                          Image(systemName: "eye.fill")
-                                              .font(.system(size: 15, weight: .bold))
-                                              .foregroundColor(.white)
-                                              .frame(width: 38, height: 38)
-                                              .background(Color.white.opacity(0.2))
-                                              .clipShape(Circle())
-                                      }
-                                  }
-                                  .padding(.horizontal, 12)
-                                  .padding(.vertical, 8)
-                              }
-                              .background(.ultraThinMaterial)
-                              .clipShape(Capsule())
-                              .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1))
-                              .shadow(color: .black.opacity(0.45), radius: 10, x: 0, y: 5)
-                              .padding(.horizontal, 16)
-                              .padding(.bottom, 12)
-                          }
-                      }
-
-                      // 7. Instant Privacy Boss Screen Shield
+                      // 8. Instant Privacy Boss Screen Shield
                       if vm.isPrivacyLocked {
                           ZStack {
                               Rectangle()
@@ -1839,24 +2055,42 @@ jobs:
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
                   }
-                  // Sheet 2: Save-State Backup Vault
+                  // Sheet 2: Save-State Backup Vault (With Clipboard Export/Import!)
                   .sheet(isPresented: $showSaveStatesSheet) {
                       NavigationView {
                           VStack {
                               HStack {
                                   TextField("اسم التختيمة (مثال: الفصل الثاني)...", text: $newSaveStateTitle)
                                       .textFieldStyle(RoundedBorderTextFieldStyle())
-                                  Button("نسخ احتياطي للتختيم 💾") {
+                                  Button("حفظ التختيم 💾") {
                                       vm.backupCurrentSaveState(customName: newSaveStateTitle)
                                       newSaveStateTitle = ""
                                   }
                                   .padding(.horizontal, 12).padding(.vertical, 8)
                                   .background(Color.green).foregroundColor(.white).cornerRadius(8)
-                              }.padding()
+                              }
+                              .padding(.horizontal)
+                              .padding(.top)
+
+                              HStack {
+                                  Button(action: { vm.importSaveStateFromClipboard() }) {
+                                      HStack {
+                                          Image(systemName: "doc.on.clipboard.fill")
+                                          Text("استيراد تختيمة من الحافظة 📥")
+                                      }
+                                      .font(.system(size: 14, weight: .bold))
+                                      .frame(maxWidth: .infinity)
+                                      .padding(.vertical, 8)
+                                      .background(Color.purple.opacity(0.15))
+                                      .foregroundColor(.purple)
+                                      .cornerRadius(8)
+                                  }
+                              }
+                              .padding(.horizontal)
 
                               List {
                                   if vm.saveStates.isEmpty {
-                                      Text("لا توجد تختيمات محفوظة بعد. اضغط على الزر الأخضر بالأعلى لحفظ تقدمك الحالي في اللعبة.")
+                                      Text("لا توجد تختيمات محفوظة بعد. يمكنك حفظ تختيمك أو نسخ كوده للملاحظات لحمايته عند حذف التطبيق.")
                                           .foregroundColor(.secondary)
                                   } else {
                                       ForEach(vm.saveStates) { item in
@@ -1866,19 +2100,29 @@ jobs:
                                                   Text("\(item.domain) • \(item.dateString)").font(.caption).foregroundColor(.secondary)
                                               }
                                               Spacer()
-                                              Button("استرجاع التختيم 🔄") {
+                                              Button(action: { vm.exportSaveStateToClipboard(item) }) {
+                                                  Image(systemName: "doc.on.doc")
+                                                      .padding(8)
+                                                      .background(Color.orange.opacity(0.2))
+                                                      .foregroundColor(.orange)
+                                                      .cornerRadius(8)
+                                              }
+                                              .buttonStyle(PlainButtonStyle())
+
+                                              Button("استرجاع 🔄") {
                                                   vm.restoreSaveState(item)
                                                   showSaveStatesSheet = false
                                               }
                                               .padding(.horizontal, 10).padding(.vertical, 6)
                                               .background(Color.blue).foregroundColor(.white).cornerRadius(8)
+                                              .buttonStyle(PlainButtonStyle())
                                           }
                                       }
                                       .onDelete { idx in vm.saveStates.remove(atOffsets: idx) }
                                   }
                               }
                           }
-                          .navigationTitle("خزنة حفظ تختيم الألعاب 💾")
+                          .navigationTitle("خزنة حفظ التختيم 💾")
                           .toolbar { Button("إغلاق") { showSaveStatesSheet = false } }
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
@@ -2002,6 +2246,38 @@ jobs:
                           .toolbar { Button("تم") { showSettingsSheet = false } }
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
+                  }
+              }
+          }
+
+          // Helper View for Control Center Grid Tiles
+          struct HubTileButton: View {
+              let icon: String
+              let title: String
+              let color: Color
+              let isActive: Bool
+              let action: () -> Void
+
+              var body: some View {
+                  Button(action: action) {
+                      VStack(spacing: 6) {
+                          Image(systemName: icon)
+                              .font(.system(size: 18, weight: .bold))
+                              .foregroundColor(isActive ? color : .white)
+                          Text(title)
+                              .font(.system(size: 11, weight: .bold, design: .rounded))
+                              .foregroundColor(.white)
+                              .lineLimit(1)
+                              .minimumScaleFactor(0.8)
+                      }
+                      .frame(maxWidth: .infinity)
+                      .frame(height: 64)
+                      .background(isActive ? Color.white.opacity(0.22) : Color.white.opacity(0.10))
+                      .cornerRadius(14)
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 14)
+                              .stroke(isActive ? color.opacity(0.6) : Color.clear, lineWidth: 1.2)
+                      )
                   }
               }
           }
