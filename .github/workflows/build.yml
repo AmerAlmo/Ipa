@@ -8,13 +8,13 @@ jobs:
       - name: Create App Files
         run: |
           cat << 'EOF' > project.yml
-          name: GameTranslatorHD
+          name: GameTranslatorUltra
           options:
-            bundleIdPrefix: com.ipad.nativehd
+            bundleIdPrefix: com.ipad.ultrahd
             deploymentTarget:
               iOS: "15.0"
           targets:
-            GameTranslatorHD:
+            GameTranslatorUltra:
               type: application
               platform: iOS
               supportedDestinations: [iOS]
@@ -23,14 +23,18 @@ jobs:
               settings:
                 base:
                   TARGETED_DEVICE_FAMILY: "1,2"
+                  GENERATE_INFOPLIST_FILE: YES
                   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: YES
-                  INFOPLIST_KEY_UIRequiresFullScreen: NO
               info:
                 path: Info.plist
                 properties:
-                  UILaunchScreen:
-                    UIColorName: ""
+                  UIDeviceFamily:
+                    - 1
+                    - 2
+                  UILaunchScreen: {}
                   UIRequiresFullScreen: false
+                  UIStatusBarHidden: true
+                  UIViewControllerBasedStatusBarAppearance: false
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
                     - UIInterfaceOrientationPortraitUpsideDown
@@ -55,17 +59,30 @@ jobs:
               var body: some Scene {
                   WindowGroup {
                       ContentView()
-                          .ignoresSafeArea(.all, edges: .bottom)
+                          .ignoresSafeArea(.all)
+                          .statusBar(hidden: true)
                   }
               }
+          }
+
+          struct ScreenBox: Identifiable {
+              let id = UUID()
+              let originalText: String
+              var translatedText: String
+              let rect: CGRect
           }
 
           class BrowserViewModel: ObservableObject {
               @Published var urlString: String = "https://www.google.com"
               @Published var isAutoTranslating: Bool = false
+              @Published var isFullScreenTranslated: Bool = false
               @Published var isEditingRegion: Bool = false
+              @Published var isHDEnhanced: Bool = true
               @Published var translatedText: String = ""
-              @Published var region: CGRect = CGRect(x: 0.15, y: 0.68, width: 0.70, height: 0.20)
+              @Published var screenBoxes: [ScreenBox] = []
+              @Published var region: CGRect = CGRect(x: 0.15, y: 0.70, width: 0.70, height: 0.18)
+              @Published var fontSize: CGFloat = 22
+              @Published var isGoldenText: Bool = true
 
               private var lastNormalizedText: String = ""
               private var isBusy: Bool = false
@@ -82,9 +99,45 @@ jobs:
                   }
               }
 
+              func toggleHDEnhancer() {
+                  isHDEnhanced.toggle()
+                  applyHDFilter()
+              }
+
+              func applyHDFilter() {
+                  let js = """
+                  (function() {
+                      var styleId = 'ultra-hd-enhancer';
+                      var existing = document.getElementById(styleId);
+                      if (\(isHDEnhanced ? "true" : "false")) {
+                          if (!existing) {
+                              var style = document.createElement('style');
+                              style.id = styleId;
+                              style.innerHTML = `
+                                  canvas, img, video {
+                                      image-rendering: -webkit-optimize-contrast !important;
+                                      filter: contrast(1.06) saturate(1.10) brightness(1.02) !important;
+                                  }
+                                  body, * {
+                                      -webkit-font-smoothing: antialiased !important;
+                                      text-rendering: optimizeLegibility !important;
+                                  }
+                              `;
+                              document.head.appendChild(style);
+                          }
+                      } else if (existing) {
+                          existing.remove();
+                      }
+                  })();
+                  """
+                  webView?.evaluateJavaScript(js, completionHandler: nil)
+              }
+
               func toggleAutoTranslate() {
                   isAutoTranslating.toggle()
                   if isAutoTranslating {
+                      isFullScreenTranslated = false
+                      screenBoxes.removeAll()
                       isEditingRegion = false
                       lastNormalizedText = ""
                       startTimer()
@@ -96,9 +149,22 @@ jobs:
                   }
               }
 
+              func toggleFullScreenTranslate() {
+                  if isFullScreenTranslated {
+                      isFullScreenTranslated = false
+                      screenBoxes.removeAll()
+                  } else {
+                      isAutoTranslating = false
+                      stopTimer()
+                      isEditingRegion = false
+                      isFullScreenTranslated = true
+                      captureFullScreenOnce()
+                  }
+              }
+
               private func startTimer() {
                   stopTimer()
-                  timer = Timer.scheduledTimer(withTimeInterval: 0.85, repeats: true) { [weak self] _ in
+                  timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
                       self?.captureAndTranslate(force: false)
                   }
               }
@@ -113,7 +179,10 @@ jobs:
                   isBusy = true
 
                   let config = WKSnapshotConfiguration()
-                  // Capture at native Retina scale
+                  // Capture at high Retina resolution for razor-sharp OCR
+                  let scale = UIScreen.main.scale
+                  config.snapshotWidth = NSNumber(value: Double(webView.bounds.width * scale))
+
                   webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
                           self?.isBusy = false
@@ -134,11 +203,11 @@ jobs:
                           return
                       }
 
-                      self.recognizeText(in: croppedCGImage, force: force)
+                      self.recognizeRegionText(in: croppedCGImage, force: force)
                   }
               }
 
-              private func recognizeText(in cgImage: CGImage, force: Bool) {
+              private func recognizeRegionText(in cgImage: CGImage, force: Bool) {
                   let request = VNRecognizeTextRequest { [weak self] req, _ in
                       guard let self = self,
                             let results = req.results as? [VNRecognizedTextObservation] else {
@@ -151,13 +220,11 @@ jobs:
                       for obs in sorted {
                           if let top = obs.topCandidates(1).first {
                               let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
-                              if txt.count >= 2 {
-                                  lines.append(txt)
-                              }
+                              if txt.count >= 2 { lines.append(txt) }
                           }
                       }
 
-                      let fullText = lines.joined(separator: "\n")
+                      let fullText = lines.joined(separator: " ")
                       let normalized = fullText.lowercased().filter { $0.isLetter || $0.isNumber }
 
                       if normalized.isEmpty {
@@ -170,14 +237,20 @@ jobs:
                       }
 
                       if !force && normalized == self.lastNormalizedText {
-                          DispatchQueue.main.async {
-                              self.isBusy = false
-                          }
+                          DispatchQueue.main.async { self.isBusy = false }
                           return
                       }
 
                       self.lastNormalizedText = normalized
-                      self.translateText(fullText)
+                      self.translateSingleText(fullText) { [weak self] translated in
+                          DispatchQueue.main.async {
+                              guard let self = self else { return }
+                              if self.isAutoTranslating {
+                                  self.translatedText = translated
+                              }
+                              self.isBusy = false
+                          }
+                      }
                   }
 
                   request.recognitionLevel = .accurate
@@ -185,37 +258,103 @@ jobs:
                   request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR", "de-DE"]
 
                   DispatchQueue.global(qos: .userInitiated).async {
-                      try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+                      autoreleasepool {
+                          try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+                      }
                   }
               }
 
-              private func translateText(_ text: String) {
+              private func captureFullScreenOnce() {
+                  guard let webView = webView, !isBusy else { return }
+                  isBusy = true
+                  screenBoxes.removeAll()
+
+                  let config = WKSnapshotConfiguration()
+                  let scale = UIScreen.main.scale
+                  config.snapshotWidth = NSNumber(value: Double(webView.bounds.width * scale))
+
+                  webView.takeSnapshot(with: config) { [weak self] image, _ in
+                      guard let self = self, let cgImage = image?.cgImage else {
+                          self?.isBusy = false
+                          return
+                      }
+
+                      let request = VNRecognizeTextRequest { [weak self] req, _ in
+                          guard let self = self,
+                                let results = req.results as? [VNRecognizedTextObservation] else {
+                              DispatchQueue.main.async { self?.isBusy = false }
+                              return
+                          }
+
+                          var temp: [ScreenBox] = []
+                          for obs in results {
+                              guard let top = obs.topCandidates(1).first else { continue }
+                              let txt = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                              if txt.count < 2 { continue }
+                              let b = obs.boundingBox
+                              let rect = CGRect(x: b.origin.x, y: 1.0 - b.origin.y - b.size.height, width: b.size.width, height: b.size.height)
+                              temp.append(ScreenBox(originalText: txt, translatedText: "...", rect: rect))
+                          }
+
+                          DispatchQueue.main.async {
+                              self.screenBoxes = temp
+                              let group = DispatchGroup()
+                              for i in self.screenBoxes.indices {
+                                  group.enter()
+                                  let orig = self.screenBoxes[i].originalText
+                                  self.translateSingleText(orig) { translated in
+                                      DispatchQueue.main.async {
+                                          if i < self.screenBoxes.count {
+                                              self.screenBoxes[i].translatedText = translated
+                                          }
+                                          group.leave()
+                                      }
+                                  }
+                              }
+                              group.notify(queue: .main) {
+                                  self.isBusy = false
+                              }
+                          }
+                      }
+
+                      request.recognitionLevel = .accurate
+                      request.usesLanguageCorrection = true
+                      request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR", "de-DE"]
+
+                      DispatchQueue.global(qos: .userInitiated).async {
+                          autoreleasepool {
+                              try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+                          }
+                      }
+                  }
+              }
+
+              private func translateSingleText(_ text: String, completion: @escaping (String) -> Void) {
                   guard let enc = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
                         let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=\(enc)") else {
-                      DispatchQueue.main.async { self.isBusy = false }
+                      completion(text)
                       return
                   }
 
-                  URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                  URLSession.shared.dataTask(with: url) { data, _, _ in
                       var res = text
                       if let data = data,
                          let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
                          let arr = json.first as? [[Any]] {
                           res = arr.compactMap { $0.first as? String }.joined()
                       }
-                      DispatchQueue.main.async {
-                          guard let self = self else { return }
-                          if self.isAutoTranslating {
-                              self.translatedText = res
-                          }
-                          self.isBusy = false
-                      }
+                      completion(res)
                   }.resume()
               }
           }
 
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
+
+              func makeCoordinator() -> Coordinator {
+                  Coordinator(vm: vm)
+              }
+
               func makeUIView(context: Context) -> WKWebView {
                   let prefs = WKWebpagePreferences()
                   prefs.allowsContentJavaScript = true
@@ -226,37 +365,68 @@ jobs:
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
 
+                  // Inject High-DPI & Sharp Rendering Script on every page load
+                  let hdScript = WKUserScript(
+                      source: """
+                      var style = document.createElement('style');
+                      style.id = 'ultra-hd-enhancer';
+                      style.innerHTML = 'canvas, img, video { image-rendering: -webkit-optimize-contrast !important; filter: contrast(1.06) saturate(1.10) brightness(1.02) !important; } body, * { -webkit-font-smoothing: antialiased !important; }';
+                      document.documentElement.appendChild(style);
+                      """,
+                      injectionTime: .atDocumentEnd,
+                      forMainFrameOnly: false
+                  )
+                  config.userContentController.addUserScript(hdScript)
+
                   let wv = WKWebView(frame: .zero, configuration: config)
-                  // Force Desktop Safari on iPadOS User-Agent for crisp Canvas rendering
-                  wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+                  wv.navigationDelegate = context.coordinator
+                  wv.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
                   wv.allowsBackForwardNavigationGestures = true
                   wv.scrollView.contentInsetAdjustmentBehavior = .never
-                  wv.contentScaleFactor = UIScreen.main.scale
+                  wv.isOpaque = false
+                  wv.backgroundColor = .black
+                  wv.contentScaleFactor = UIScreen.main.nativeScale
+                  wv.layer.contentsScale = UIScreen.main.nativeScale
                   vm.webView = wv
                   if let url = URL(string: vm.urlString) { wv.load(URLRequest(url: url)) }
                   return wv
               }
+
               func updateUIView(_ uiView: WKWebView, context: Context) {
-                  uiView.contentScaleFactor = UIScreen.main.scale
+                  uiView.contentScaleFactor = UIScreen.main.nativeScale
+              }
+
+              class Coordinator: NSObject, WKNavigationDelegate {
+                  var vm: BrowserViewModel
+                  init(vm: BrowserViewModel) { self.vm = vm }
+                  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+                      vm.applyHDFilter()
+                  }
               }
           }
 
           struct ContentView: View {
               @StateObject private var vm = BrowserViewModel()
-              @State private var showBar = true
+              @State private var showBar = false
+              @State private var hideControls = false
               @State private var dragStartRegion: CGRect? = nil
               @State private var resizeStartRegion: CGRect? = nil
 
               var body: some View {
                   ZStack {
+                      Color.black.ignoresSafeArea(.all)
+
                       VStack(spacing: 0) {
                           if showBar {
                               HStack(spacing: 12) {
                                   Button(action: { vm.webView?.goBack() }) {
-                                      Image(systemName: "chevron.backward").font(.system(size: 18, weight: .semibold)).padding(8)
+                                      Image(systemName: "chevron.backward").font(.system(size: 18, weight: .bold)).foregroundColor(.white).padding(8)
+                                  }
+                                  Button(action: { vm.webView?.goForward() }) {
+                                      Image(systemName: "chevron.forward").font(.system(size: 18, weight: .bold)).foregroundColor(.white).padding(8)
                                   }
                                   Button(action: { vm.webView?.reload() }) {
-                                      Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .semibold)).padding(8)
+                                      Image(systemName: "arrow.clockwise").font(.system(size: 18, weight: .bold)).foregroundColor(.white).padding(8)
                                   }
                                   TextField("أدخل رابط اللعبة...", text: $vm.urlString, onCommit: { vm.loadURL() })
                                       .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -265,12 +435,14 @@ jobs:
                                       .disableAutocorrection(true)
                                   Button("ذهاب") { vm.loadURL() }
                                       .font(.system(size: 16, weight: .bold))
-                                      .padding(.horizontal, 16).padding(.vertical, 8)
-                                      .background(Color.blue).foregroundColor(.white).cornerRadius(8)
+                                      .padding(.horizontal, 18).padding(.vertical, 8)
+                                      .background(LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing))
+                                      .foregroundColor(.white)
+                                      .cornerRadius(10)
                               }
-                              .padding(.horizontal, 16)
-                              .padding(.vertical, 8)
-                              .background(Color(UIColor.secondarySystemBackground))
+                              .padding(.horizontal, 20)
+                              .padding(.vertical, 10)
+                              .background(.ultraThinMaterial)
                           }
 
                           GeometryReader { geo in
@@ -283,34 +455,77 @@ jobs:
                                   WebViewWrapper(vm: vm)
                                       .frame(width: geo.size.width, height: geo.size.height)
 
+                                  // Cinema-Grade Region Subtitle Overlay
                                   if vm.isAutoTranslating && !vm.translatedText.isEmpty && !vm.isEditingRegion {
                                       Text(vm.translatedText)
-                                          .font(.system(size: 22, weight: .bold))
-                                          .foregroundColor(.white)
-                                          .shadow(color: .black, radius: 2, x: 0, y: 1)
+                                          .font(.system(size: vm.fontSize, weight: .bold, design: .rounded))
+                                          .foregroundColor(vm.isGoldenText ? Color(red: 1.0, green: 0.92, blue: 0.45) : .white)
+                                          .shadow(color: .black, radius: 3, x: 0, y: 2)
                                           .multilineTextAlignment(.center)
-                                          .padding(.horizontal, 18)
-                                          .padding(.vertical, 12)
+                                          .padding(.horizontal, 22)
+                                          .padding(.vertical, 14)
                                           .frame(maxWidth: boxW)
-                                          .background(Color.black.opacity(0.82))
-                                          .cornerRadius(12)
+                                          .background(
+                                              RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                  .fill(Color.black.opacity(0.78))
+                                                  .overlay(
+                                                      RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                          .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                                                  )
+                                          )
                                           .position(x: boxX, y: boxY)
                                           .allowsHitTesting(false)
                                   }
 
+                                  // Full-Screen Manga-Style Overlay Boxes
+                                  if vm.isFullScreenTranslated {
+                                      ForEach(vm.screenBoxes) { box in
+                                          Text(box.translatedText)
+                                              .font(.system(size: max(vm.fontSize - 4, 14), weight: .bold, design: .rounded))
+                                              .foregroundColor(vm.isGoldenText ? Color(red: 1.0, green: 0.92, blue: 0.45) : .white)
+                                              .shadow(color: .black, radius: 2, x: 0, y: 1)
+                                              .multilineTextAlignment(.center)
+                                              .padding(8)
+                                              .background(
+                                                  RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                      .fill(Color.black.opacity(0.85))
+                                                      .overlay(
+                                                          RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                              .stroke(Color.cyan.opacity(0.4), lineWidth: 1)
+                                                      )
+                                              )
+                                              .frame(
+                                                  width: max(box.rect.width * geo.size.width, 100),
+                                                  height: max(box.rect.height * geo.size.height, 36)
+                                              )
+                                              .position(
+                                                  x: box.rect.midX * geo.size.width,
+                                                  y: box.rect.midY * geo.size.height
+                                              )
+                                              .allowsHitTesting(false)
+                                      }
+                                  }
+
+                                  // Modern Region Selector Editor
                                   if vm.isEditingRegion {
                                       ZStack(alignment: .bottomTrailing) {
-                                          Rectangle()
-                                              .fill(Color.green.opacity(0.22))
-                                              .border(Color.green, width: 3)
+                                          RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                              .fill(Color.cyan.opacity(0.18))
                                               .overlay(
-                                                  Text("اسحب الصندوق لتحريكه فوق الحوار\nواسحب الدائرة بالزاوية لتغيير الحجم")
-                                                      .font(.system(size: 16, weight: .bold))
-                                                      .foregroundColor(.white)
-                                                      .multilineTextAlignment(.center)
-                                                      .padding(8)
-                                                      .background(Color.black.opacity(0.75))
-                                                      .cornerRadius(8)
+                                                  RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                                      .stroke(Color.cyan, style: StrokeStyle(lineWidth: 2.5, dash: [8, 4]))
+                                              )
+                                              .overlay(
+                                                  VStack(spacing: 6) {
+                                                      Image(systemName: "viewfinder").font(.system(size: 24, weight: .bold)).foregroundColor(.cyan)
+                                                      Text("اسحب المربع فوق مكان الحوار\nواسحب الدائرة بالزاوية لتغيير المقاس")
+                                                          .font(.system(size: 15, weight: .bold, design: .rounded))
+                                                          .foregroundColor(.white)
+                                                          .multilineTextAlignment(.center)
+                                                  }
+                                                  .padding(12)
+                                                  .background(Color.black.opacity(0.75))
+                                                  .cornerRadius(12)
                                               )
                                               .gesture(
                                                   DragGesture()
@@ -327,9 +542,10 @@ jobs:
                                               )
 
                                           Circle()
-                                              .fill(Color.green)
-                                              .frame(width: 38, height: 38)
-                                              .overlay(Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.black).font(.system(size: 16, weight: .bold)))
+                                              .fill(LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                              .frame(width: 40, height: 40)
+                                              .shadow(radius: 4)
+                                              .overlay(Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.white).font(.system(size: 16, weight: .bold)))
                                               .offset(x: 14, y: 14)
                                               .gesture(
                                                   DragGesture()
@@ -352,51 +568,165 @@ jobs:
                           }
                       }
 
+                      // Sleek Glassmorphic Floating Control Dock
                       VStack {
                           Spacer()
-                          HStack(spacing: 12) {
-                              Button(action: { withAnimation { showBar.toggle() } }) {
-                                  Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                      .font(.system(size: 18, weight: .bold))
-                                      .padding(14)
-                                      .background(Color.gray.opacity(0.85))
-                                      .foregroundColor(.white)
-                                      .clipShape(Circle())
+                          HStack(spacing: 10) {
+                              if !hideControls {
+                                  HStack(spacing: 8) {
+                                      // Back Button
+                                      Button(action: { vm.webView?.goBack() }) {
+                                          Image(systemName: "arrow.uturn.backward")
+                                              .font(.system(size: 15, weight: .bold))
+                                              .foregroundColor(.white)
+                                              .frame(width: 38, height: 38)
+                                              .background(Color.white.opacity(0.15))
+                                              .clipShape(Circle())
+                                      }
+
+                                      // URL Bar Toggle
+                                      Button(action: { withAnimation(.spring()) { showBar.toggle() } }) {
+                                          Image(systemName: showBar ? "safari.fill" : "safari")
+                                              .font(.system(size: 16, weight: .bold))
+                                              .foregroundColor(showBar ? .cyan : .white)
+                                              .frame(width: 38, height: 38)
+                                              .background(Color.white.opacity(0.15))
+                                              .clipShape(Circle())
+                                      }
+
+                                      // HD Graphics Enhancer Toggle
+                                      Button(action: { vm.toggleHDEnhancer() }) {
+                                          HStack(spacing: 4) {
+                                              Image(systemName: "sparkles")
+                                              Text("HD")
+                                          }
+                                          .font(.system(size: 13, weight: .heavy, design: .rounded))
+                                          .foregroundColor(vm.isHDEnhanced ? .black : .white)
+                                          .padding(.horizontal, 10)
+                                          .frame(height: 38)
+                                          .background(vm.isHDEnhanced ? Color.yellow : Color.white.opacity(0.15))
+                                          .clipShape(Capsule())
+                                      }
+
+                                      // Font Size & Color Controls
+                                      Button(action: { vm.fontSize = min(vm.fontSize + 2, 34) }) {
+                                          Text("A+")
+                                              .font(.system(size: 14, weight: .bold))
+                                              .foregroundColor(.white)
+                                              .frame(width: 36, height: 38)
+                                              .background(Color.white.opacity(0.15))
+                                              .clipShape(Circle())
+                                      }
+
+                                      Button(action: { vm.fontSize = max(vm.fontSize - 2, 14) }) {
+                                          Text("A-")
+                                              .font(.system(size: 14, weight: .bold))
+                                              .foregroundColor(.white)
+                                              .frame(width: 36, height: 38)
+                                              .background(Color.white.opacity(0.15))
+                                              .clipShape(Circle())
+                                      }
+
+                                      Button(action: { vm.isGoldenText.toggle() }) {
+                                          Circle()
+                                              .fill(vm.isGoldenText ? Color(red: 1.0, green: 0.9, blue: 0.3) : Color.white)
+                                              .frame(width: 22, height: 22)
+                                              .overlay(Circle().stroke(Color.black.opacity(0.5), lineWidth: 1))
+                                              .frame(width: 36, height: 38)
+                                              .background(Color.white.opacity(0.15))
+                                              .clipShape(Circle())
+                                      }
+
+                                      Divider().frame(height: 24).background(Color.white.opacity(0.3))
+
+                                      // Region Selector Button
+                                      Button(action: {
+                                          withAnimation(.spring()) {
+                                              vm.isEditingRegion.toggle()
+                                              if vm.isEditingRegion {
+                                                  vm.isAutoTranslating = false
+                                                  vm.isFullScreenTranslated = false
+                                              }
+                                          }
+                                      }) {
+                                          HStack(spacing: 6) {
+                                              Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
+                                              Text(vm.isEditingRegion ? "تثبيت" : "المنطقة")
+                                          }
+                                          .font(.system(size: 14, weight: .bold, design: .rounded))
+                                          .foregroundColor(.white)
+                                          .padding(.horizontal, 12)
+                                          .frame(height: 38)
+                                          .background(vm.isEditingRegion ? Color.green : Color.orange.opacity(0.9))
+                                          .clipShape(Capsule())
+                                      }
+
+                                      // Auto Region Translate Button
+                                      Button(action: { vm.toggleAutoTranslate() }) {
+                                          HStack(spacing: 6) {
+                                              Image(systemName: vm.isAutoTranslating ? "pause.fill" : "play.fill")
+                                              Text(vm.isAutoTranslating ? "إيقاف التلقائي" : "ترجمة تلقائية")
+                                          }
+                                          .font(.system(size: 14, weight: .bold, design: .rounded))
+                                          .foregroundColor(.white)
+                                          .padding(.horizontal, 14)
+                                          .frame(height: 38)
+                                          .background(
+                                              LinearGradient(
+                                                  colors: vm.isAutoTranslating ? [.red, .pink] : [.blue, .cyan],
+                                                  startPoint: .leading,
+                                                  endPoint: .trailing
+                                              )
+                                          )
+                                          .clipShape(Capsule())
+                                      }
+
+                                      // Single-Tap Full Screen Translate Toggle
+                                      Button(action: { vm.toggleFullScreenTranslate() }) {
+                                          HStack(spacing: 6) {
+                                              Image(systemName: vm.isFullScreenTranslated ? "xmark.circle.fill" : "doc.text.viewfinder")
+                                              Text(vm.isFullScreenTranslated ? "إخفاء الشاشة" : "ترجمة الشاشة")
+                                          }
+                                          .font(.system(size: 14, weight: .bold, design: .rounded))
+                                          .foregroundColor(.white)
+                                          .padding(.horizontal, 14)
+                                          .frame(height: 38)
+                                          .background(
+                                              LinearGradient(
+                                                  colors: vm.isFullScreenTranslated ? [.purple, .pink] : [.indigo, .purple],
+                                                  startPoint: .leading,
+                                                  endPoint: .trailing
+                                              )
+                                          )
+                                          .clipShape(Capsule())
+                                      }
+                                  }
+                                  .padding(.horizontal, 12)
+                                  .padding(.vertical, 8)
+                                  .background(.ultraThinMaterial)
+                                  .clipShape(Capsule())
+                                  .overlay(
+                                      Capsule().stroke(Color.white.opacity(0.2), lineWidth: 1)
+                                  )
+                                  .shadow(color: .black.opacity(0.4), radius: 10, x: 0, y: 5)
                               }
 
                               Spacer()
 
-                              Button(action: {
-                                  vm.isEditingRegion.toggle()
-                                  if vm.isEditingRegion { vm.isAutoTranslating = false }
-                              }) {
-                                  HStack(spacing: 8) {
-                                      Image(systemName: vm.isEditingRegion ? "checkmark.circle.fill" : "viewfinder")
-                                      Text(vm.isEditingRegion ? "تثبيت المنطقة" : "تحديد المنطقة")
-                                  }
-                                  .font(.system(size: 16, weight: .bold))
-                                  .padding(.horizontal, 18).padding(.vertical, 12)
-                                  .background(vm.isEditingRegion ? Color.green : Color.orange)
-                                  .foregroundColor(.white)
-                                  .cornerRadius(25)
-                                  .shadow(radius: 3)
-                              }
-
-                              Button(action: { vm.toggleAutoTranslate() }) {
-                                  HStack(spacing: 8) {
-                                      Image(systemName: vm.isAutoTranslating ? "pause.circle.fill" : "play.circle.fill")
-                                      Text(vm.isAutoTranslating ? "إيقاف التلقائي" : "ترجمة تلقائية")
-                                  }
-                                  .font(.system(size: 16, weight: .bold))
-                                  .padding(.horizontal, 18).padding(.vertical, 12)
-                                  .background(vm.isAutoTranslating ? Color.red : Color.blue)
-                                  .foregroundColor(.white)
-                                  .cornerRadius(25)
-                                  .shadow(radius: 3)
+                              // Eye Button to Hide/Show All Controls
+                              Button(action: { withAnimation(.spring()) { hideControls.toggle() } }) {
+                                  Image(systemName: hideControls ? "eye.slash.fill" : "eye.fill")
+                                      .font(.system(size: 15, weight: .bold))
+                                      .foregroundColor(.white)
+                                      .frame(width: 42, height: 42)
+                                      .background(.ultraThinMaterial)
+                                      .clipShape(Circle())
+                                      .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                      .shadow(radius: 5)
                               }
                           }
-                          .padding(.horizontal, 28)
-                          .padding(.bottom, 20)
+                          .padding(.horizontal, 20)
+                          .padding(.bottom, 14)
                       }
                   }
               }
@@ -407,8 +737,8 @@ jobs:
         run: |
           brew install xcodegen
           xcodegen generate
-          xcodebuild -project GameTranslatorHD.xcodeproj \
-            -scheme GameTranslatorHD \
+          xcodebuild -project GameTranslatorUltra.xcodeproj \
+            -scheme GameTranslatorUltra \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
@@ -417,11 +747,11 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
           mkdir Payload
-          cp -r build/Build/Products/Release-iphoneos/GameTranslatorHD.app Payload/
-          zip -r GameTranslatorHD.ipa Payload
+          cp -r build/Build/Products/Release-iphoneos/GameTranslatorUltra.app Payload/
+          zip -r GameTranslatorUltra.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Ready-GameTranslatorHD-IPA
-          path: GameTranslatorHD.ipa
+          name: Ready-GameTranslatorUltra-IPA
+          path: GameTranslatorUltra.ipa
