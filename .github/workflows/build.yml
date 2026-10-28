@@ -104,6 +104,41 @@ jobs:
               let isLightBubble: Bool
           }
 
+          // MARK: - Subtitle Color Presets
+          enum SubColorPreset: Int, CaseIterable {
+              case gold = 0
+              case white = 1
+              case cyan = 2
+              case green = 3
+              case pink = 4
+              case orange = 5
+              case custom = 6
+
+              var name: String {
+                  switch self {
+                  case .gold: return "ذهبي سينمائي"
+                  case .white: return "أبيض ناصع"
+                  case .cyan: return "سماوي مشع"
+                  case .green: return "أخضر نيون"
+                  case .pink: return "وردي فاتح"
+                  case .orange: return "برتقالي دافئ"
+                  case .custom: return "لون مخصص 🎨"
+                  }
+              }
+
+              var color: Color {
+                  switch self {
+                  case .gold: return Color(red: 1.0, green: 0.90, blue: 0.35)
+                  case .white: return .white
+                  case .cyan: return Color(red: 0.35, green: 0.95, blue: 1.0)
+                  case .green: return Color(red: 0.40, green: 1.0, blue: 0.55)
+                  case .pink: return Color(red: 1.0, green: 0.55, blue: 0.85)
+                  case .orange: return Color(red: 1.0, green: 0.68, blue: 0.25)
+                  case .custom: return .white
+                  }
+              }
+          }
+
           // MARK: - Main ViewModel
           class BrowserViewModel: ObservableObject {
               @Published var urlString: String {
@@ -116,16 +151,23 @@ jobs:
               @Published var isAutoScrolling: Bool = false
               @Published var scrollSpeed: Double = 1.5
 
-              // Advanced Toggles
+              // Advanced Toggles & Speed Settings
               @Published var showVirtualKeys: Bool = false
               @Published var isPrivacyLocked: Bool = false
               @Published var hideSubtitlesTemp: Bool = false
               @Published var gameSpeed: Double = 1.0
-              @Published var ttsMode: Int = 0 // 0: Off, 1: English Voice, 2: Arabic Voice
-              @Published var usePreProcessing: Bool = true
+              @Published var ttsMode: Int = 0 // 0: Off, 1: Source Voice, 2: Arabic Voice
+              @Published var usePreProcessing: Bool = false // Off by default for faster OCR
               @Published var useEcoTouchMode: Bool = true
               @Published var mangaCleanBubbleMode: Bool = true
               @Published var isScannerSleeping: Bool = false
+              @Published var useFastOCR: Bool {
+                  didSet { UserDefaults.standard.set(useFastOCR, forKey: "fast_ocr") }
+              }
+              @Published var ocrLanguageMode: Int {
+                  // 0: English/Latin (Fastest), 1: Asian + English (Manga/JRPG)
+                  didSet { UserDefaults.standard.set(ocrLanguageMode, forKey: "ocr_lang_mode") }
+              }
 
               // Tap-to-Define Popup
               @Published var selectedWord: String = ""
@@ -151,12 +193,18 @@ jobs:
                   didSet { UserDefaults.standard.set(useCustomSubPos, forKey: "use_custom_sub") }
               }
 
-              // Styling
+              // Styling & Colors
               @Published var fontSize: CGFloat {
                   didSet { UserDefaults.standard.set(Double(fontSize), forKey: "font_size") }
               }
-              @Published var isGoldenText: Bool {
-                  didSet { UserDefaults.standard.set(isGoldenText, forKey: "golden_text") }
+              @Published var colorPresetIndex: Int {
+                  didSet { UserDefaults.standard.set(colorPresetIndex, forKey: "color_preset") }
+              }
+              @Published var customTextColor: Color = Color(red: 1.0, green: 0.9, blue: 0.4) {
+                  didSet { saveCustomColor(customTextColor) }
+              }
+              @Published var subBgOpacity: Double {
+                  didSet { UserDefaults.standard.set(subBgOpacity, forKey: "sub_bg_opacity") }
               }
               @Published var showDualSubtitles: Bool {
                   didSet { UserDefaults.standard.set(showDualSubtitles, forKey: "dual_subs") }
@@ -204,7 +252,19 @@ jobs:
               private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
               weak var webView: WKWebView?
 
+              var activeSubtitleColor: Color {
+                  let preset = SubColorPreset(rawValue: colorPresetIndex) ?? .gold
+                  if preset == .custom {
+                      return customTextColor
+                  }
+                  return preset.color
+              }
+
               init() {
+                  // Ensure TTS plays even if device is on silent switch and mixes with game audio
+                  try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
+                  try? AVAudioSession.sharedInstance().setActive(true)
+
                   let d = UserDefaults.standard
                   self.urlString = d.string(forKey: "saved_url") ?? "https://www.google.com"
 
@@ -229,10 +289,20 @@ jobs:
                   self.useCustomSubPos = d.object(forKey: "use_custom_sub") as? Bool ?? true
                   let savedFont = d.double(forKey: "font_size")
                   self.fontSize = savedFont > 10 ? CGFloat(savedFont) : 22
-                  self.isGoldenText = d.object(forKey: "golden_text") as? Bool ?? true
+                  self.colorPresetIndex = d.object(forKey: "color_preset") as? Int ?? 0
+                  self.subBgOpacity = d.object(forKey: "sub_bg_opacity") as? Double ?? 0.82
                   self.showDualSubtitles = d.object(forKey: "dual_subs") as? Bool ?? false
                   self.useGeminiAI = d.object(forKey: "use_gemini") as? Bool ?? false
                   self.geminiApiKey = d.string(forKey: "gemini_key") ?? ""
+                  self.useFastOCR = d.object(forKey: "fast_ocr") as? Bool ?? false
+                  self.ocrLanguageMode = d.object(forKey: "ocr_lang_mode") as? Int ?? 0
+
+                  if d.object(forKey: "cust_r") != nil {
+                      let r = d.double(forKey: "cust_r")
+                      let g = d.double(forKey: "cust_g")
+                      let b = d.double(forKey: "cust_b")
+                      self.customTextColor = Color(red: r, green: g, blue: b)
+                  }
 
                   if let data = d.data(forKey: "bookmarks_list"),
                      let decoded = try? JSONDecoder().decode([BookmarkItem].self, from: data) {
@@ -260,6 +330,21 @@ jobs:
                   }
               }
 
+              private func saveCustomColor(_ color: Color) {
+                  let uiColor = UIColor(color)
+                  var r: CGFloat = 1, g: CGFloat = 1, b: CGFloat = 1, a: CGFloat = 1
+                  if uiColor.getRed(&r, green: &g, blue: &b, alpha: &a) {
+                      let d = UserDefaults.standard
+                      d.set(Double(r), forKey: "cust_r")
+                      d.set(Double(g), forKey: "cust_g")
+                      d.set(Double(b), forKey: "cust_b")
+                  }
+              }
+
+              func cycleSubtitleColor() {
+                  colorPresetIndex = (colorPresetIndex + 1) % 6
+              }
+
               private func saveRect(_ r: CGRect, prefix: String) {
                   let d = UserDefaults.standard
                   d.set(Double(r.origin.x), forKey: prefix + "x")
@@ -279,14 +364,14 @@ jobs:
                   }
               }
 
-              // Wake up scanner when user touches the game screen
+              // Fast wake-up when user taps screen
               func notifyUserInteraction() {
                   unchangedTicks = 0
                   if isScannerSleeping {
                       isScannerSleeping = false
                   }
                   if isAutoTranslating {
-                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                           self?.captureAndTranslate(force: false)
                       }
                   }
@@ -306,14 +391,14 @@ jobs:
                           document.dispatchEvent(evUp);
                           window.dispatchEvent(evUp);
                           if (canvas) canvas.dispatchEvent(evUp);
-                      }, 60);
+                      }, 50);
                   })();
                   """
                   webView?.evaluateJavaScript(js, completionHandler: nil)
                   notifyUserInteraction()
               }
 
-              // Game Speedhack Controller
+              // True Engine Game Speedhack Controller (Timeout + Interval + Performance.now)
               func cycleGameSpeed() {
                   if gameSpeed == 1.0 { gameSpeed = 1.5 }
                   else if gameSpeed == 1.5 { gameSpeed = 2.0 }
@@ -333,6 +418,20 @@ jobs:
                               var adj = (typeof delay === 'number' && window.__ultSpeed > 1.0) ? (delay / window.__ultSpeed) : delay;
                               return origTimeout.apply(this, [fn, adj].concat(Array.prototype.slice.call(arguments, 2)));
                           };
+                          var origInterval = window.setInterval;
+                          window.setInterval = function(fn, delay) {
+                              var adj = (typeof delay === 'number' && window.__ultSpeed > 1.0) ? (delay / window.__ultSpeed) : delay;
+                              return origInterval.apply(this, [fn, adj].concat(Array.prototype.slice.call(arguments, 2)));
+                          };
+                          var origPerfNow = performance.now.bind(performance);
+                          var lastRealTime = origPerfNow();
+                          var virtualTime = lastRealTime;
+                          performance.now = function() {
+                              var now = origPerfNow();
+                              virtualTime += (now - lastRealTime) * window.__ultSpeed;
+                              lastRealTime = now;
+                              return virtualTime;
+                          };
                       }
                   })();
                   """
@@ -346,7 +445,7 @@ jobs:
                   webView?.evaluateJavaScript(muteJS, completionHandler: nil)
               }
 
-              // Save-State Backup & Restore
+              // Safe Base64 Save-State Backup & Restore
               func backupCurrentSaveState(customName: String) {
                   let js = "JSON.stringify(localStorage);"
                   webView?.evaluateJavaScript(js) { [weak self] result, _ in
@@ -363,16 +462,19 @@ jobs:
               }
 
               func restoreSaveState(_ item: SaveStateItem) {
-                  let escaped = item.jsonStorage
-                      .replacingOccurrences(of: "\\", with: "\\\\")
-                      .replacingOccurrences(of: "'", with: "\\'")
+                  guard let data = item.jsonStorage.data(using: .utf8) else { return }
+                  let base64 = data.base64EncodedString()
                   let js = """
                   (function() {
                       try {
-                          var data = JSON.parse('\(escaped)');
+                          var binStr = window.atob('\(base64)');
+                          var bytes = new Uint8Array(binStr.length);
+                          for (var i = 0; i < binStr.length; i++) { bytes[i] = binStr.charCodeAt(i); }
+                          var jsonStr = new TextDecoder().decode(bytes);
+                          var data = JSON.parse(jsonStr);
                           for (var k in data) { localStorage.setItem(k, data[k]); }
                           location.reload();
-                      } catch(e) {}
+                      } catch(e) { console.error(e); }
                   })();
                   """
                   webView?.evaluateJavaScript(js, completionHandler: nil)
@@ -406,7 +508,6 @@ jobs:
                   selectedWord = clean
                   selectedWordMeaning = "..."
 
-                  // Pronounce the tapped English word
                   synthesizer.stopSpeaking(at: .immediate)
                   let utt = AVSpeechUtterance(string: clean)
                   utt.voice = AVSpeechSynthesisVoice(language: "en-US")
@@ -508,9 +609,10 @@ jobs:
                   }
               }
 
+              // Turbo Timer (0.42s instead of 1.0s)
               private func startTimer() {
                   stopTimer()
-                  timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                  timer = Timer.scheduledTimer(withTimeInterval: 0.42, repeats: true) { [weak self] _ in
                       guard let self = self else { return }
                       if self.useEcoTouchMode && self.isScannerSleeping { return }
                       self.captureAndTranslate(force: false)
@@ -522,7 +624,6 @@ jobs:
                   timer = nil
               }
 
-              // CoreImage Pre-Processing for 3D Game Subtitles
               private func preprocessImage(_ cgImage: CGImage) -> CGImage {
                   guard usePreProcessing else { return cgImage }
                   let ciImage = CIImage(cgImage: cgImage)
@@ -537,7 +638,6 @@ jobs:
                   return processed
               }
 
-              // Detect if Manga Bubble is Bright/White
               private func isBrightRegion(_ cgImage: CGImage) -> Bool {
                   let ciImage = CIImage(cgImage: cgImage)
                   guard let filter = CIFilter(name: "CIAreaAverage", parameters: [
@@ -555,9 +655,10 @@ jobs:
                   guard let webView = webView, !isBusy, !isPrivacyLocked else { return }
                   isBusy = true
 
+                  // Optimized Snapshot Width (1.25x max) for 3x faster capture & OCR
                   let config = WKSnapshotConfiguration()
-                  let scale = UIScreen.main.scale
-                  config.snapshotWidth = NSNumber(value: Double(webView.bounds.width * scale))
+                  let targetWidth = min(webView.bounds.width * 1.25, 1366)
+                  config.snapshotWidth = NSNumber(value: Double(max(targetWidth, 600)))
 
                   webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
@@ -581,6 +682,16 @@ jobs:
 
                       let finalImage = self.preprocessImage(croppedCGImage)
                       self.recognizeRegionText(in: finalImage, force: force)
+                  }
+              }
+
+              private func activeRecognitionLanguages() -> [String] {
+                  if ocrLanguageMode == 0 {
+                      // Fast Latin/European Mode
+                      return ["en-US", "es-ES", "fr-FR", "de-DE"]
+                  } else {
+                      // Full Asian + English Mode
+                      return ["en-US", "ja-JP", "zh-Hans", "ko-KR"]
                   }
               }
 
@@ -629,7 +740,7 @@ jobs:
                       if !force && normalized == self.lastNormalizedText {
                           DispatchQueue.main.async {
                               self.unchangedTicks += 1
-                              if self.useEcoTouchMode && self.unchangedTicks >= 6 {
+                              if self.useEcoTouchMode && self.unchangedTicks >= 10 {
                                   self.isScannerSleeping = true
                               }
                               self.isBusy = false
@@ -663,11 +774,11 @@ jobs:
                       }
                   }
 
-                  request.recognitionLevel = .accurate
-                  request.usesLanguageCorrection = true
-                  request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR", "de-DE"]
+                  request.recognitionLevel = (useFastOCR && ocrLanguageMode == 0) ? .fast : .accurate
+                  request.usesLanguageCorrection = !useFastOCR
+                  request.recognitionLanguages = activeRecognitionLanguages()
 
-                  DispatchQueue.global(qos: .userInitiated).async {
+                  DispatchQueue.global(qos: .userInteractive).async {
                       autoreleasepool {
                           try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
                       }
@@ -680,8 +791,8 @@ jobs:
                   screenBoxes.removeAll()
 
                   let config = WKSnapshotConfiguration()
-                  let scale = UIScreen.main.scale
-                  config.snapshotWidth = NSNumber(value: Double(webView.bounds.width * scale))
+                  let targetWidth = min(webView.bounds.width * 1.5, 1600)
+                  config.snapshotWidth = NSNumber(value: Double(max(targetWidth, 800)))
 
                   webView.takeSnapshot(with: config) { [weak self] image, _ in
                       guard let self = self, let cgImage = image?.cgImage else {
@@ -740,9 +851,9 @@ jobs:
 
                       request.recognitionLevel = .accurate
                       request.usesLanguageCorrection = true
-                      request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hans", "ko-KR", "es-ES", "fr-FR", "de-DE"]
+                      request.recognitionLanguages = self.activeRecognitionLanguages()
 
-                      DispatchQueue.global(qos: .userInitiated).async {
+                      DispatchQueue.global(qos: .userInteractive).async {
                           autoreleasepool {
                               try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
                           }
@@ -768,12 +879,16 @@ jobs:
                   let cleanKey = geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
                   if useGeminiAI && !cleanKey.isEmpty {
                       translateWithGemini(text: preText, speaker: speaker, apiKey: cleanKey) { [weak self] res in
-                          self?.translationCache[preText] = res
+                          if !res.isEmpty && res != preText {
+                              self?.translationCache[preText] = res
+                          }
                           completion(res)
                       }
                   } else {
                       translateGoogleGTX(preText) { [weak self] res in
-                          self?.translationCache[preText] = res
+                          if !res.isEmpty && res != preText {
+                              self?.translationCache[preText] = res
+                          }
                           completion(res)
                       }
                   }
@@ -790,7 +905,7 @@ jobs:
                   let prompt = """
                   أنت مترجم ألعاب ومانجا محترف. ترجم هذا الحوار إلى لغة عربية طبيعية وسينمائية مناسبة للسياق.
                   التزم بقاموس الأسماء التالي: \(glossaryRules).
-                  أعطني النص المترجم فقط بدون أي شرح.
+                  أعطني النص العربي المترجم فقط بدون أي شرح.
                   سياق الحوارات السابقة:
                   \(recentContext)
                   المتحدث الحالي: \(speaker)
@@ -800,6 +915,7 @@ jobs:
                   let body: [String: Any] = ["contents": [["parts": [["text": prompt]]]]]
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
+                  req.timeoutInterval = 4.0
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
@@ -817,26 +933,77 @@ jobs:
                   }.resume()
               }
 
+              // Strict URL Encoding (Fixes ?, &, +, = breaking Arabic translation)
+              private func strictURLEncode(_ text: String) -> String? {
+                  var allowed = CharacterSet.urlQueryAllowed
+                  allowed.remove(charactersIn: "!*'();:@&=+$,/?%#[]")
+                  return text.addingPercentEncoding(withAllowedCharacters: allowed)
+              }
+
+              // Dual-Engine Fast Arabic Translator (GTX + Clients5 Fallback)
               private func translateGoogleGTX(_ text: String, completion: @escaping (String) -> Void) {
-                  guard let enc = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-                        let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&q=\(enc)") else {
+                  guard let enc = strictURLEncode(text),
+                        let url = URL(string: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ar&dt=t&dj=1&q=\(enc)") else {
                       completion(text)
                       return
                   }
 
-                  URLSession.shared.dataTask(with: url) { data, _, _ in
-                      var res = text
-                      if let data = data,
-                         let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
-                         let arr = json.first as? [[Any]] {
-                          res = arr.compactMap { $0.first as? String }.joined()
+                  var req = URLRequest(url: url)
+                  req.timeoutInterval = 3.0
+                  req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+
+                  URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+                      if let data = data {
+                          // Parse dj=1 JSON format first
+                          if let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                             let sentences = dict["sentences"] as? [[String: Any]] {
+                              let combined = sentences.compactMap { $0["trans"] as? String }.joined()
+                              if !combined.isEmpty {
+                                  completion(combined)
+                                  return
+                              }
+                          }
+                          // Parse classic nested array format
+                          if let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
+                             let arr = json.first as? [[Any]] {
+                              let combined = arr.compactMap { $0.first as? String }.joined()
+                              if !combined.isEmpty {
+                                  completion(combined)
+                                  return
+                              }
+                          }
                       }
-                      completion(res)
+                      // Fallback to Secondary Google Mirror if Primary fails
+                      self?.translateGoogleFallback(text, encoded: enc, completion: completion)
+                  }.resume()
+              }
+
+              private func translateGoogleFallback(_ originalText: String, encoded: String, completion: @escaping (String) -> Void) {
+                  guard let url = URL(string: "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=ar&q=\(encoded)") else {
+                      completion(originalText)
+                      return
+                  }
+                  var req = URLRequest(url: url)
+                  req.timeoutInterval = 3.0
+                  req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+                  URLSession.shared.dataTask(with: req) { data, _, _ in
+                      if let data = data,
+                         let json = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                          if let firstArr = json.first as? [Any], let trans = firstArr.first as? String, !trans.isEmpty {
+                              completion(trans)
+                              return
+                          } else if let directStr = json.first as? String, !directStr.isEmpty {
+                              completion(directStr)
+                              return
+                          }
+                      }
+                      completion(originalText)
                   }.resume()
               }
           }
 
-          // MARK: - WebView Wrapper with AdBlock, Touch Hook & Multi-Touch Gestures
+          // MARK: - WebView Wrapper
           struct WebViewWrapper: UIViewRepresentable {
               @ObservedObject var vm: BrowserViewModel
               var onTwoFingerTap: () -> Void
@@ -855,15 +1022,15 @@ jobs:
                   config.defaultWebpagePreferences = prefs
                   config.allowsInlineMediaPlayback = true
                   config.mediaTypesRequiringUserActionForPlayback = []
+                  if #available(iOS 15.4, *) {
+                      config.preferences.isElementFullscreenEnabled = true
+                  }
 
-                  // 1. AdBlocker, Popup Blocker, HD Enhancer & Touch Wakeup Hook
                   let masterScript = WKUserScript(
                       source: """
                       (function() {
-                          // Block Popups
                           window.open = function() { return null; };
 
-                          // HD Filter & Ad Hiding CSS
                           var style = document.createElement('style');
                           style.id = 'ultra-hd-enhancer';
                           style.innerHTML = `
@@ -873,7 +1040,6 @@ jobs:
                           `;
                           document.documentElement.appendChild(style);
 
-                          // Notify Swift on Touch/Key to Wake Up Eco Scanner
                           var notifyTouch = function() {
                               if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.gameHook) {
                                   window.webkit.messageHandlers.gameHook.postMessage('touch');
@@ -901,14 +1067,12 @@ jobs:
                   wv.contentScaleFactor = UIScreen.main.nativeScale
                   wv.layer.contentsScale = UIScreen.main.nativeScale
 
-                  // 2-Finger Tap: Toggle Subtitles Visibility
                   let twoFingerTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTwoFingerTap))
                   twoFingerTap.numberOfTouchesRequired = 2
                   twoFingerTap.cancelsTouchesInView = false
                   twoFingerTap.delegate = context.coordinator
                   wv.addGestureRecognizer(twoFingerTap)
 
-                  // 3-Finger Tap: Toggle Controls Dock
                   let threeFingerTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleThreeFingerTap))
                   threeFingerTap.numberOfTouchesRequired = 3
                   threeFingerTap.cancelsTouchesInView = false
@@ -941,7 +1105,6 @@ jobs:
                       }
                   }
 
-                  // Block target="_blank" ad popups
                   func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
                       if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
                           if url.host == webView.url?.host {
@@ -982,6 +1145,8 @@ jobs:
               let subY: CGFloat
 
               var body: some View {
+                  let words = Array(vm.currentOriginalText.split(separator: " ").map(String.init).enumerated())
+
                   VStack(spacing: 6) {
                       if !vm.speakerName.isEmpty {
                           Text(vm.speakerName)
@@ -993,16 +1158,15 @@ jobs:
                               .clipShape(Capsule())
                       }
 
-                      // Interactive Tap-to-Define Original Words
-                      if vm.showDualSubtitles && !vm.currentOriginalText.isEmpty {
+                      if vm.showDualSubtitles && !words.isEmpty {
                           ScrollView(.horizontal, showsIndicators: false) {
                               HStack(spacing: 5) {
-                                  ForEach(vm.currentOriginalText.split(separator: " ").map(String.init), id: \.self) { word in
-                                      Button(action: { vm.lookupWord(word) }) {
-                                          Text(word)
+                                  ForEach(words, id: \.offset) { item in
+                                      Button(action: { vm.lookupWord(item.element) }) {
+                                          Text(item.element)
                                               .font(.system(size: max(vm.fontSize - 6, 13), weight: .semibold))
                                               .foregroundColor(.white.opacity(0.9))
-                                              .underline( color: .cyan.opacity(0.6))
+                                              .underline(color: .cyan.opacity(0.6))
                                       }
                                   }
                               }
@@ -1029,9 +1193,10 @@ jobs:
 
                       Text(vm.translatedText)
                           .font(.system(size: vm.fontSize, weight: .bold, design: .rounded))
-                          .foregroundColor(vm.isGoldenText ? Color(red: 1.0, green: 0.92, blue: 0.45) : .white)
+                          .foregroundColor(vm.activeSubtitleColor)
                           .shadow(color: .black, radius: 3, x: 0, y: 2)
                           .multilineTextAlignment(.center)
+                          .environment(\.layoutDirection, .rightToLeft)
                           .allowsHitTesting(false)
                   }
                   .padding(.horizontal, 22)
@@ -1039,10 +1204,10 @@ jobs:
                   .frame(maxWidth: max(boxW, screenW * 0.65))
                   .background(
                       RoundedRectangle(cornerRadius: 16, style: .continuous)
-                          .fill(Color.black.opacity(0.82))
+                          .fill(Color.black.opacity(vm.subBgOpacity))
                           .overlay(
                               RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                  .stroke(vm.isScannerSleeping ? Color.green.opacity(0.45) : Color.white.opacity(0.22), lineWidth: 1)
+                                  .stroke(vm.isScannerSleeping ? Color.green.opacity(0.45) : vm.activeSubtitleColor.opacity(0.35), lineWidth: 1.2)
                           )
                   )
                   .position(x: subX, y: subY)
@@ -1055,40 +1220,68 @@ jobs:
 
               var body: some View {
                   VStack(spacing: 8) {
-                      Text("أزرار تحكم PC 🎮")
-                          .font(.system(size: 11, weight: .bold))
-                          .foregroundColor(.cyan)
-
                       HStack(spacing: 8) {
                           Button(action: { vm.sendPCKey(key: " ", code: "Space", keyCode: 32) }) {
                               Text("Space (التالي)")
-                                  .font(.system(size: 13, weight: .bold))
-                                  .padding(.horizontal, 12).padding(.vertical, 8)
-                                  .background(Color.blue.opacity(0.8)).foregroundColor(.white).cornerRadius(8)
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.blue.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
+                          }
+                          Button(action: { vm.sendPCKey(key: "z", code: "KeyZ", keyCode: 90) }) {
+                              Text("Z (تأكيد)")
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.teal.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
+                          }
+                          Button(action: { vm.sendPCKey(key: "x", code: "KeyX", keyCode: 88) }) {
+                              Text("X (إلغاء)")
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.indigo.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Control", code: "ControlLeft", keyCode: 17) }) {
                               Text("Ctrl (تخطي)")
-                                  .font(.system(size: 13, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 8)
-                                  .background(Color.purple.opacity(0.8)).foregroundColor(.white).cornerRadius(8)
-                          }
-                          Button(action: { vm.sendPCKey(key: "h", code: "KeyH", keyCode: 72) }) {
-                              Text("H (إخفاء)")
-                                  .font(.system(size: 13, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 8)
-                                  .background(Color.orange.opacity(0.8)).foregroundColor(.white).cornerRadius(8)
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.purple.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Escape", code: "Escape", keyCode: 27) }) {
-                              Text("Esc (القائمة)")
-                                  .font(.system(size: 13, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 8)
-                                  .background(Color.red.opacity(0.8)).foregroundColor(.white).cornerRadius(8)
+                              Text("Esc")
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.red.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
                           }
                           Button(action: { vm.sendPCKey(key: "Enter", code: "Enter", keyCode: 13) }) {
                               Text("Enter")
-                                  .font(.system(size: 13, weight: .bold))
-                                  .padding(.horizontal, 10).padding(.vertical, 8)
-                                  .background(Color.green.opacity(0.8)).foregroundColor(.white).cornerRadius(8)
+                                  .font(.system(size: 12, weight: .bold))
+                                  .padding(.horizontal, 10).padding(.vertical, 7)
+                                  .background(Color.green.opacity(0.85)).foregroundColor(.white).cornerRadius(8)
+                          }
+                      }
+
+                      // RPG Maker Arrow Keys Row
+                      HStack(spacing: 12) {
+                          Button(action: { vm.sendPCKey(key: "ArrowLeft", code: "ArrowLeft", keyCode: 37) }) {
+                              Image(systemName: "arrow.left").font(.system(size: 14, weight: .bold))
+                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                          }
+                          Button(action: { vm.sendPCKey(key: "ArrowUp", code: "ArrowUp", keyCode: 38) }) {
+                              Image(systemName: "arrow.up").font(.system(size: 14, weight: .bold))
+                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                          }
+                          Button(action: { vm.sendPCKey(key: "ArrowDown", code: "ArrowDown", keyCode: 40) }) {
+                              Image(systemName: "arrow.down").font(.system(size: 14, weight: .bold))
+                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                          }
+                          Button(action: { vm.sendPCKey(key: "ArrowRight", code: "ArrowRight", keyCode: 39) }) {
+                              Image(systemName: "arrow.right").font(.system(size: 14, weight: .bold))
+                                  .frame(width: 36, height: 30).background(Color.white.opacity(0.2)).foregroundColor(.white).cornerRadius(7)
+                          }
+                          Button(action: { vm.sendPCKey(key: "h", code: "KeyH", keyCode: 72) }) {
+                              Text("H (إخفاء نص اللعبة)")
+                                  .font(.system(size: 11, weight: .bold))
+                                  .padding(.horizontal, 8).frame(height: 30)
+                                  .background(Color.orange.opacity(0.85)).foregroundColor(.white).cornerRadius(7)
                           }
                       }
                   }
@@ -1186,15 +1379,16 @@ jobs:
                                       ForEach(vm.screenBoxes) { box in
                                           Text(box.translatedText)
                                               .font(.system(size: max(vm.fontSize - 4, 14), weight: .bold, design: .rounded))
-                                              .foregroundColor(box.isLightBubble ? .black : (vm.isGoldenText ? Color(red: 1.0, green: 0.92, blue: 0.45) : .white))
+                                              .foregroundColor(box.isLightBubble ? .black : vm.activeSubtitleColor)
                                               .multilineTextAlignment(.center)
+                                              .environment(\.layoutDirection, .rightToLeft)
                                               .padding(6)
                                               .background(
                                                   RoundedRectangle(cornerRadius: box.isLightBubble ? 14 : 10, style: .continuous)
-                                                      .fill(box.isLightBubble ? Color.white.opacity(0.96) : Color.black.opacity(0.86))
+                                                      .fill(box.isLightBubble ? Color.white.opacity(0.96) : Color.black.opacity(vm.subBgOpacity))
                                                       .overlay(
                                                           RoundedRectangle(cornerRadius: box.isLightBubble ? 14 : 10, style: .continuous)
-                                                              .stroke(box.isLightBubble ? Color.black.opacity(0.2) : Color.cyan.opacity(0.4), lineWidth: 1)
+                                                              .stroke(box.isLightBubble ? Color.black.opacity(0.2) : vm.activeSubtitleColor.opacity(0.4), lineWidth: 1)
                                                       )
                                               )
                                               .frame(
@@ -1209,7 +1403,7 @@ jobs:
                                       }
                                   }
 
-                                  // 3. Virtual PC Hotkeys Floating Bar (Top Center)
+                                  // 3. Virtual PC Hotkeys Floating Bar
                                   if vm.showVirtualKeys {
                                       VStack {
                                           VirtualHotkeysOverlay(vm: vm)
@@ -1283,7 +1477,7 @@ jobs:
                                       }
                                       .padding(.horizontal, 18)
                                       .padding(.vertical, 12)
-                                      .background(Color.yellow)
+                                      .background(vm.activeSubtitleColor)
                                       .cornerRadius(20)
                                       .shadow(color: .black.opacity(0.6), radius: 6)
                                       .position(x: subX, y: subY)
@@ -1393,6 +1587,18 @@ jobs:
                                               .clipShape(Circle())
                                       }
 
+                                      // Quick Subtitle Color Switcher Button 🎨
+                                      Button(action: { vm.cycleSubtitleColor() }) {
+                                          ZStack {
+                                              Circle()
+                                                  .fill(Color.white.opacity(0.15))
+                                                  .frame(width: 38, height: 38)
+                                              Image(systemName: "paintpalette.fill")
+                                                  .font(.system(size: 15, weight: .bold))
+                                                  .foregroundColor(vm.activeSubtitleColor)
+                                          }
+                                      }
+
                                       // Virtual PC Hotkeys Toggle
                                       Button(action: { withAnimation { vm.showVirtualKeys.toggle() } }) {
                                           Image(systemName: "gamecontroller.fill")
@@ -1466,7 +1672,7 @@ jobs:
                                           .clipShape(Capsule())
                                       }
 
-                                      // Settings & Glossary & AI
+                                      // Settings & Glossary & Colors
                                       Button(action: { showSettingsSheet = true }) {
                                           Image(systemName: vm.useGeminiAI ? "brain.head.profile" : "gearshape.fill")
                                               .font(.system(size: 15, weight: .bold))
@@ -1714,13 +1920,45 @@ jobs:
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
                   }
-                  // Sheet 4: Advanced Settings, Glossary & AI
+                  // Sheet 4: Advanced Settings, Colors, Speed & Glossary
                   .sheet(isPresented: $showSettingsSheet) {
                       NavigationView {
                           Form {
-                              Section(header: Text("المعالجة البصرية وتوفير الطاقة")) {
-                                  Toggle("فلتر تعزيز وضوح الحروف (CoreImage 🔬)", isOn: $vm.usePreProcessing)
-                                  Toggle("حساس اللمس الذكي لتوفير البطارية (Eco 🔋)", isOn: $vm.useEcoTouchMode)
+                              Section(header: Text("استوديو ألوان وشكل الترجمة 🎨")) {
+                                  Picker("لون خط الترجمة", selection: $vm.colorPresetIndex) {
+                                      ForEach(SubColorPreset.allCases, id: \.rawValue) { preset in
+                                          Text(preset.name).tag(preset.rawValue)
+                                      }
+                                  }
+
+                                  if vm.colorPresetIndex == SubColorPreset.custom.rawValue {
+                                      ColorPicker("اختر لونك المفضل للخط", selection: $vm.customTextColor, supportsOpacity: false)
+                                  }
+
+                                  HStack {
+                                      Text("حجم الخط: \(Int(vm.fontSize))")
+                                      Slider(value: $vm.fontSize, in: 14...38, step: 1)
+                                  }
+
+                                  HStack {
+                                      Text("عتامة خلفية النص: \(Int(vm.subBgOpacity * 100))%")
+                                      Slider(value: $vm.subBgOpacity, in: 0.2...1.0, step: 0.05)
+                                  }
+
+                                  Toggle("النص المزدوج مع القاموس التفاعلي باللمس", isOn: $vm.showDualSubtitles)
+                                  Button("إعادة مكان الترجمة فوق مربع المسح مباشرة") {
+                                      vm.useCustomSubPos = false
+                                  }
+                              }
+
+                              Section(header: Text("سرعة الترجمة ومحرك القراءة (Turbo OCR ⚡)")) {
+                                  Picker("لغة اللعبة الأصلية", selection: $vm.ocrLanguageMode) {
+                                      Text("إنجليزي / أوروبي (الأسرع ⚡)").tag(0)
+                                      Text("ياباني / صيني / كوري + إنجليزي").tag(1)
+                                  }
+                                  Toggle("وضع القراءة الفائقة السرعة (Fast OCR 🚀)", isOn: $vm.useFastOCR)
+                                  Toggle("فلتر تباين الحروف للخلفيات المعقدة (🔬)", isOn: $vm.usePreProcessing)
+                                  Toggle("توفير البطارية الذكي عند ثبات الشاشة (🔋)", isOn: $vm.useEcoTouchMode)
                                   Toggle("تبييض فقاعات المانجا تلقائياً (🎨)", isOn: $vm.mangaCleanBubbleMode)
                               }
 
@@ -1747,18 +1985,6 @@ jobs:
                                   .onDelete { idx in vm.glossary.remove(atOffsets: idx) }
                               }
 
-                              Section(header: Text("حجم ولون خط الترجمة")) {
-                                  HStack {
-                                      Text("حجم الخط: \(Int(vm.fontSize))")
-                                      Slider(value: $vm.fontSize, in: 14...36, step: 1)
-                                  }
-                                  Toggle("اللون الذهبي السينمائي للترجمة", isOn: $vm.isGoldenText)
-                                  Toggle("النص المزدوج مع القاموس التفاعلي باللمس", isOn: $vm.showDualSubtitles)
-                                  Button("إعادة مكان الترجمة فوق مربع المسح مباشرة") {
-                                      vm.useCustomSubPos = false
-                                  }
-                              }
-
                               Section(header: Text("الترجمة الذكية بالذكاء الاصطناعي (Gemini AI 🧠)")) {
                                   Toggle("تفعيل ترجمة السياق الذكية (Gemini)", isOn: $vm.useGeminiAI)
                                   SecureField("أدخل مفتاح Gemini API المجاني (اختياري)", text: $vm.geminiApiKey)
@@ -1772,7 +1998,7 @@ jobs:
                                   }
                               }
                           }
-                          .navigationTitle("الإعدادات المتقدمة والقاموس ⚙️")
+                          .navigationTitle("الإعدادات والألوان والسرعة ⚙️")
                           .toolbar { Button("تم") { showSettingsSheet = false } }
                       }
                       .navigationViewStyle(StackNavigationViewStyle())
@@ -1786,6 +2012,7 @@ jobs:
           brew install xcodegen
           xcodegen generate
           xcodebuild -project GameTranslatorUltra.xcodeproj \
+            clean build \
             -scheme GameTranslatorUltra \
             -configuration Release \
             -sdk iphoneos \
@@ -1794,9 +2021,12 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
-          mkdir Payload
-          cp -r build/Build/Products/Release-iphoneos/GameTranslatorUltra.app Payload/
-          zip -r GameTranslatorUltra.ipa Payload
+
+          mkdir -p Payload
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -name "*.app" | head -n 1)
+          cp -r "$APP_PATH" Payload/
+          codesign --force --deep --sign - Payload/GameTranslatorUltra.app
+          zip -r -y GameTranslatorUltra.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
